@@ -1,6 +1,6 @@
-## file-demo：mini 顺序存储引擎说明
+## mini-file-storage：mini 顺序存储引擎说明
 
-file-demo 是一个极简版的“顺序存储引擎”示例，用来演示：
+mini-file-storage 是一个极简版的“顺序存储引擎”示例，用来演示：
 
 - 如何基于 mmap 管理多段顺序文件；
 - 如何在物理日志之上封装“记录格式”；
@@ -15,16 +15,15 @@ file-demo 是一个极简版的“顺序存储引擎”示例，用来演示：
 ### 1. CommitLog：物理日志文件
 
 - 对应类：
-  - [MmapSequentialLog](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/core/MmapSequentialLog.java)
-  - [SimpleMappedFileQueue](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/core/SimpleMappedFileQueue.java)
-  - [SimpleMappedFile](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/core/SimpleMappedFile.java)
-  - [RecordStore](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/store/RecordStore.java)
-
+  - [MmapSequentialLog]
+  - [SimpleMappedFileQueue]
+  - [SimpleMappedFile]
+  - [RecordStore]
 - 目录与文件名：
 
 | 维度       | 说明                                                                 |
 |------------|----------------------------------------------------------------------|
-| 目录       | 由 `SequentialLogConfig.storePath` 决定，例如 `./docs/file-demo-data-test` |
+| 目录       | 由 `SequentialLogConfig.storePath` 决定，例如 `./docs/mini-file-storage-data-test` |
 | 单文件大小 | `SequentialLogConfig.fileSize`，例如 8MB                            |
 | 文件命名   | `SimpleMappedFileQueue.formatFileName` 使用 `%020d` 格式化起始偏移，如 `00000000000000000000` |
 | 起始偏移   | 文件名对应的 long 值，即该文件覆盖的 CommitLog 起始物理 offset          |
@@ -55,9 +54,8 @@ file-demo 是一个极简版的“顺序存储引擎”示例，用来演示：
 ### 2. LogRecord：业务对象编码格式
 
 - 对应类：
-  - [LogRecord](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/model/LogRecord.java)
-  - [LogRecordCodec](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/codec/LogRecordCodec.java)
-
+  - [LogRecord]
+  - [LogRecordCodec]
 - 字段：
 
 | 字段       | 类型    | 含义     |
@@ -83,14 +81,14 @@ file-demo 是一个极简版的“顺序存储引擎”示例，用来演示：
 ### 3. ConsumeQueue：逻辑消费队列索引
 
 - 对应类：
-  - [SimpleConsumeQueue](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/index/SimpleConsumeQueue.java)
-  - [SimpleIndexEntry](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/index/SimpleIndexEntry.java)
+  - [SimpleConsumeQueue]
+  - [SimpleIndexEntry]
 
 - 目录与文件名：
 
 | 维度       | 说明                                                                 |
 |------------|----------------------------------------------------------------------|
-93→| 目录       | 由构造函数参数 `storePath` 决定，例如 `./docs/file-demo-cq-test`    |
+93→| 目录       | 由构造函数参数 `storePath` 决定，例如 `./docs/mini-file-storage-cq-test`    |
 94→| 单文件大小 | 由构造函数参数 `mappedFileSize` 决定，运行时会向下对齐为 `CQ_STORE_UNIT_SIZE` 的整数倍 |
 | 文件命名   | 与 CommitLog 相同，用 `%020d` 格式化起始“索引文件内偏移”             |
 | 起始偏移   | 文件名对应的 long 值，表示该索引文件覆盖的索引字节起始位置           |
@@ -130,13 +128,13 @@ file-demo 是一个极简版的“顺序存储引擎”示例，用来演示：
 ### 4. KeyIndexFile：按 keyHash 查找物理 offset
 
 - 对应类：
-  - [KeyIndexFile](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/index/KeyIndexFile.java)
+  - [KeyIndexFile]
 
 - 目录与文件名：
 
 | 维度       | 说明                                                                |
 |------------|---------------------------------------------------------------------|
-| 目录       | 由构造函数参数 `storePath` 决定，例如 `./docs/file-demo-key-index-test` |
+| 目录       | 由构造函数参数 `storePath` 决定，例如 `./docs/mini-file-storage-key-index-test` |
 | 单文件大小 | 构造函数参数 `fileSize`，例如 1MB                                   |
 | 文件命名   | 同样用 `%020d` 表示起始索引字节偏移                                   |
 
@@ -340,12 +338,11 @@ file-demo 是一个极简版的“顺序存储引擎”示例，用来演示：
 
 1. 看协议表格（本 README 第一、三部分），脑中先有“磁盘上到底长什么样”；
 2. 看核心类：
-   - [SimpleMappedFileQueue](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/core/SimpleMappedFileQueue.java)
-   - [MmapSequentialLog](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/core/MmapSequentialLog.java)
-   - [RecordStore](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/store/RecordStore.java)
-   - [SimpleConsumeQueue](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/index/SimpleConsumeQueue.java)
-   - [KeyIndexFile](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/main/java/com/example/filedemo/index/KeyIndexFile.java)
-3. 跑一遍单测 [FileDemoTest](file:///Users/hanzhipeng/Documents/studyspace/rocketmq-rocketmq-all-4.4.0/file-demo/src/test/java/com/example/filedemo/FileDemoTest.java)，尤其是：
+   - [SimpleMappedFileQueue]
+   - [RecordStore]
+   - [SimpleConsumeQueue]
+   - [KeyIndexFile]
+3. 跑一遍单测 [FileDemoTest]，尤其是：
    - 物理/逻辑 offset 读取；
    - 时间范围查询；
    - key 查询；
@@ -393,11 +390,11 @@ file-demo 是一个极简版的“顺序存储引擎”示例，用来演示：
 
 ---
 
-## 四、RocketMQ 与 file-demo mini 对比表
+## 四、RocketMQ 与 mini-file-storage mini 对比表
 
 下面用一个表格对比 RocketMQ 真实实现和本 demo mini 实现的关系，方便对号入座：
 
-| 维度/特性                  | RocketMQ                                                   | file-demo mini 实现                                                                |
+| 维度/特性                  | RocketMQ                                                   | mini-file-storage mini 实现                                                                |
 |---------------------------|------------------------------------------------------------|------------------------------------------------------------------------------------|
 | 物理存储                  | CommitLog 多文件队列（MappedFileQueue）                   | `MmapSequentialLog` + `SimpleMappedFileQueue`                                      |
 | 单文件管理                | 固定大小，文件名为起始 offset，滚动创建                   | 同样：固定大小文件，文件名为起始 offset，滚动创建                                  |
@@ -415,7 +412,7 @@ file-demo 是一个极简版的“顺序存储引擎”示例，用来演示：
 | 事务、重试、顺序消息等    | 上层协议和存储配合实现                                    | 未实现，聚焦底层存储原理                                                          |
 | 实现复杂度                | 完整生产级实现，代码量大                                  | 核心逻辑浓缩到少量类，适合学习和实验                                               |
 
-可以简单理解为：**file-demo 把 RocketMQ 存储里的“CommitLog + ConsumeQueue + KeyIndex + Checkpoint”抽出一个最小可运行子集，用来演示顺序写、索引和恢复的基本思路**。
+可以简单理解为：**mini-file-storage 把 RocketMQ 存储里的“CommitLog + ConsumeQueue + KeyIndex + Checkpoint”抽出一个最小可运行子集，用来演示顺序写、索引和恢复的基本思路**。
 
 ---
 
@@ -423,8 +420,6 @@ file-demo 是一个极简版的“顺序存储引擎”示例，用来演示：
 
 ### 1. Demo 入口（手动运行）
 
-- Demo 入口类：`com.example.filedemo.demo.FileDemoMain`
-- 所在目录：`src/test/java/com/example/filedemo/demo/FileDemoMain.java`
 - 行为：
   - 构造 `SequentialLogConfig` 和 `MmapSequentialLog`；
   - 构造 `RecordStore<LogRecord>` 和 `LogRecordCodec`；
@@ -452,7 +447,7 @@ file-demo 是一个极简版的“顺序存储引擎”示例，用来演示：
 在模块根目录执行：
 
 ```bash
-cd file-demo
+cd mini-file-storage
 mvn test
 ```
 
@@ -467,7 +462,7 @@ mvn test
 ### 1. 推荐阅读顺序
 
 - 第一步：先阅读“RocketMQ 底层存储整体设计概览”，掌握 CommitLog / ConsumeQueue / IndexFile / Checkpoint / Reput 的整体关系；
-- 第二步：再看“file-demo mini 存储引擎设计”，对照 RocketMQ 概念理解 `MmapSequentialLog`、`RecordStore`、`SimpleConsumeQueue`、`KeyIndexFile` 各自的职责；
+- 第二步：再看“mini-file-storage mini 存储引擎设计”，对照 RocketMQ 概念理解 `MmapSequentialLog`、`RecordStore`、`SimpleConsumeQueue`、`KeyIndexFile` 各自的职责；
 - 第三步：结合下面的“写入 / 读取 / 启动恢复 / 重放”流程图，建立模块之间的调用图像；
 - 第四步：最后对照 `FileDemoTest` 和 `FileDemoMain`，从测试/运行示例验证自己对流程的理解。
 

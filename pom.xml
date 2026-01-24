@@ -5,8 +5,8 @@
   <artifactId>file-storage</artifactId>
   <packaging>jar</packaging>
   <version>1.0-SNAPSHOT</version>
-  <name>Maven Quick Start Archetype</name>
-  <url>http://maven.apache.org</url>
+  <name>mini-file-storage</name>
+
   <dependencies>
     <dependency>
       <groupId>junit</groupId>
