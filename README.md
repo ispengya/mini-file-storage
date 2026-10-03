@@ -1,11 +1,45 @@
-## mini-file-storage：mini 顺序存储引擎说明
+## mini-file-storage:通用嵌入式顺序记录存储引擎
 
-mini-file-storage 是一个极简版的“顺序存储引擎”示例，用来演示：
+mini-file-storage 是一个 **零第三方依赖(仅 JDK)** 的迷你顺序存储引擎:在 mmap 分段顺序文件之上封装记录格式、逻辑索引、Key 索引与 checkpoint,任何中间件都可以直接嵌入作为存储底座——消息日志、事件溯源、审计流水、简易 KV 皆可。
 
-- 如何基于 mmap 管理多段顺序文件；
-- 如何在物理日志之上封装“记录格式”；
-- 如何用一个固定长度的逻辑索引（ConsumeQueue）实现按逻辑 offset 访问；
-- 如何用一个简单的 KeyIndex 文件按 key 查询；
+### 功能一览
+
+| 功能 | 门面入口 |
+|------|----------|
+| 顺序追加写(mmap 分段文件,自动滚动) | `put(T)` |
+| 物理 offset 点读 | `get(offset)` |
+| 逻辑位点读取(ConsumeQueue 20 字节定长索引,O(1)) | `getByLogicalIndex(n)` |
+| 业务 key 索引写入与查询(KeyIndex,hash 候选) | `put(value, key)` / `getByKey(key)` |
+| tagCode 范围查询(默认 tag = 写入时刻,可当时间查询) | `queryByTagRange(begin, end)` |
+| 同步/异步刷盘 + checkpoint 落盘 | `flush()` / `StoreConfig.syncFlush` |
+| 重启恢复(CommitLog / ConsumeQueue / KeyIndex 均扫描恢复追加位置) | 相同 `StoreConfig` 重新打开 |
+
+### 快速开始(门面 API)
+
+```java
+StoreConfig config = StoreConfig.builder("./data/demo").build();
+FileStore<LogRecord> store = new MiniFileStore<>(config, new LogRecordCodec());
+
+long now = System.currentTimeMillis();
+long offset = store.put(new LogRecord(now, "INFO", "hello"));   // 泛型记录,任意业务对象
+LogRecord r1 = store.get(offset);                               // 按物理 offset 读
+LogRecord r2 = store.getByLogicalIndex(0);                      // 按逻辑位点读
+store.put(new LogRecord(now, "INFO", "order-1-body"), "order-1"); // 带业务 key 索引
+List<LogRecord> hits = store.getByKey("order-1");
+List<LogRecord> recent = store.queryByTagRange(now - 60_000, now);
+
+store.flush();
+store.close();
+```
+
+对象与字节的互转通过 `Codec<T>` 注入(内置 `LogRecordCodec` 示例)。完整行为见单元测试 `MiniFileStoreTest`。
+
+以下章节展开磁盘格式与内部机制,用于理解门面背后的实现。本工程最初是一组演示:
+
+- 如何基于 mmap 管理多段顺序文件;
+- 如何在物理日志之上封装“记录格式”;
+- 如何用一个固定长度的逻辑索引（ConsumeQueue）实现按逻辑 offset 访问;
+- 如何用一个简单的 KeyIndex 文件按 key 查询;
 - 如何用 checkpoint 记录刷盘位置，并在重启时做最基本的恢复。
 
 ---
@@ -88,8 +122,8 @@ mini-file-storage 是一个极简版的“顺序存储引擎”示例，用来�
 
 | 维度       | 说明                                                                 |
 |------------|----------------------------------------------------------------------|
-93→| 目录       | 由构造函数参数 `storePath` 决定，例如 `./docs/mini-file-storage-cq-test`    |
-94→| 单文件大小 | 由构造函数参数 `mappedFileSize` 决定，运行时会向下对齐为 `CQ_STORE_UNIT_SIZE` 的整数倍 |
+| 目录       | 由构造函数参数 `storePath` 决定，例如 `./docs/mini-file-storage-cq-test`    |
+| 单文件大小 | 由构造函数参数 `mappedFileSize` 决定，运行时会向下对齐为 `CQ_STORE_UNIT_SIZE` 的整数倍 |
 | 文件命名   | 与 CommitLog 相同，用 `%020d` 格式化起始“索引文件内偏移”             |
 | 起始偏移   | 文件名对应的 long 值，表示该索引文件覆盖的索引字节起始位置           |
 
@@ -205,8 +239,10 @@ mini-file-storage 是一个极简版的“顺序存储引擎”示例，用来�
      - 内部调用 `SimpleMappedFileQueue.recoverForConsumeQueue`；
      - 每个索引文件调用 `recoverConsumeQueueWrotePosition` 找到有效索引尾部。
 3. 创建 KeyIndexFile（可选）：
-   - `KeyIndexFile keyIndex = new KeyIndexFile(keyDir, fileSize);`
-   - 当前实现启动时不做恢复，只是继续在文件尾部顺序追加。
+   - 首次启动：`new KeyIndexFile(keyDir, fileSize);`；
+   - 重启恢复：`new KeyIndexFile(keyDir, fileSize, true);`
+     - 按 16 字节单元顺序扫描已有文件恢复追加位置，遇到全零空洞即停止；
+     - 门面 `MiniFileStore` 默认使用 recover=true。
 4. 创建 checkpoint：
    - `StoreCheckpoint checkpoint = new StoreCheckpoint(checkpointPath);`
 5. 构造 RecordStore：
@@ -312,7 +348,7 @@ mini-file-storage 是一个极简版的“顺序存储引擎”示例，用来�
 | CommitLog 恢复 | 逐文件扫描 `[length][payload]`，遇到非法长度停止            | 从 checkpoint 起步，按完整消息结构解析，严格截断尾部    | 利用 checkpoint 的 commitLog 偏移缩小扫描范围                    |
 | ConsumeQueue 恢复 | 只根据自身结构校验 `[offset][size][tagCode]`             | 额外校验 offset 是否落在 CommitLog 合法范围内          | 增加 `offset + size <= commitLogMaxOffset` 的校验                |
 | 索引重建     | 无自动重建逻辑，业务可以手工重跑写入代码                  | 通过 Reput 服务从 CommitLog 回放，自动重建 ConsumeQueue 与 IndexFile | 在 mini 中增加一个简单的“重放线程/方法”，按 CommitLog 顺序重放   |
-| IndexFile 恢复 | 启动时不做任何校验，认为 index 文件是“可有可无”的        | 读取头部元数据，检查槽位/entry 是否合理，必要时截断或删除 | 为 KeyIndexFile 增加头部和简单的损坏检测策略                    |
+| IndexFile 恢复 | 按 16 字节单元顺序扫描恢复追加位置(全零空洞即停);尚无头部元数据与校验 | 读取头部元数据，检查槽位/entry 是否合理，必要时截断或删除 | 为 KeyIndexFile 增加头部和简单的损坏检测策略                    |
 
 ### 3. 索引能力
 
@@ -429,20 +465,22 @@ mini-file-storage 是一个极简版的“顺序存储引擎”示例，用来�
   - 调用 `store.flush()` 和 `keyIndexFile.flush()` 刷盘；
   - 再根据物理 offset、逻辑 offset、时间范围、key 等方式读回，并打印到控制台。
 
-在 IDE 中直接运行 `FileDemoMain.main` 即可观察完整读写过程。
+推荐直接通过门面 `MiniFileStore`（见开头“快速开始”）走通以上全部行为，参考单元测试
+`com.ispengya.file.MiniFileStoreTest`。
 
 ### 2. 单元测试（推荐阅读）
 
-256→- 测试类：`com.example.filedemo.FileDemoTest`
-257→- 所在目录：`src/test/java/com/example/filedemo/demo/FileDemoTest.java`
-258→- 覆盖内容包括：
-259→  - `testAppendAndReadByPhysicalOffset`：验证物理 offset 读写；
-260→  - `testReadByLogicalOffset`：验证通过 ConsumeQueue 的逻辑 offset 读取；
-261→  - `testQueryByTimeRange`：验证按时间范围查询；
-262→  - `testKeyIndexQuery`：验证按 key 查询；
-263→  - `testCheckpointWrittenOnFlush`：验证 flush 时 checkpoint 正确写入；
-264→  - `testRecoverCommitLogAfterRestart`：验证 CommitLog 基于文件扫描的启动恢复；
-265→  - `testRecoverConsumeQueueAfterRestart`：验证 ConsumeQueue 启动恢复后在旧索引后继续追加并按逻辑 offset 读取。
+- 测试类：`com.ispengya.file.FileDemoTest` 与门面测试 `com.ispengya.file.MiniFileStoreTest`
+- 所在目录：`src/test/java/com/ispengya/file/`
+- 覆盖内容包括：
+  - `testAppendAndReadByPhysicalOffset`：验证物理 offset 读写；
+  - `testReadByLogicalOffset`：验证通过 ConsumeQueue 的逻辑 offset 读取；
+  - `testQueryByTimeRange`：验证按时间范围查询；
+  - `testKeyIndexQuery`：验证按 key 查询；
+  - `testCheckpointWrittenOnFlush`：验证 flush 时 checkpoint 正确写入；
+  - `testRecoverCommitLogAfterRestart`：验证 CommitLog 基于文件扫描的启动恢复；
+  - `testRecoverConsumeQueueAfterRestart`：验证 ConsumeQueue 启动恢复后在旧索引后继续追加并按逻辑 offset 读取；
+  - `MiniFileStoreTest#restartRecoveryKeepsAllIndexTypes`：验证三类文件(数据/CQ/KeyIndex)重启后均可继续追加与读取。
 
 在模块根目录执行：
 

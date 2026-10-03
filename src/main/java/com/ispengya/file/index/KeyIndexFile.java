@@ -3,6 +3,7 @@ package com.ispengya.file.index;
 import com.ispengya.file.core.SimpleMappedFile;
 import com.ispengya.file.core.SimpleMappedFileQueue;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -13,8 +14,23 @@ public class KeyIndexFile {
 
     private final SimpleMappedFileQueue mappedFileQueue;
 
+    /**
+     * 默认构造:不做启动恢复,直接在文件尾部追加(历史兼容行为)
+     */
     public KeyIndexFile(String storePath, int fileSize) {
         this.mappedFileQueue = new SimpleMappedFileQueue(storePath, fileSize);
+    }
+
+    /**
+     * @param recover true 时启动按 16 字节单元扫描已有文件并恢复追加位置,
+     *                避免重启后从文件头覆盖旧索引条目
+     */
+    public KeyIndexFile(String storePath, int fileSize, boolean recover) throws IOException {
+        if (recover) {
+            this.mappedFileQueue = SimpleMappedFileQueue.recoverForKeyIndex(storePath, fileSize);
+        } else {
+            this.mappedFileQueue = new SimpleMappedFileQueue(storePath, fileSize);
+        }
     }
 
     public synchronized void put(long keyHash, long physicalOffset) {

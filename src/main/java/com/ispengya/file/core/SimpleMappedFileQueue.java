@@ -90,6 +90,43 @@ public class SimpleMappedFileQueue {
     }
 
     /**
+     * 按 16 字节单元扫描恢复 KeyIndex 文件队列
+     * 与 recoverForConsumeQueue 同构,用于防止重启后从文件头覆盖旧索引
+     *
+     * @param storePath 索引目录
+     * @param fileSize  单文件大小
+     * @return 恢复写入位置后的文件队列
+     */
+    public static SimpleMappedFileQueue recoverForKeyIndex(String storePath, int fileSize) throws IOException {
+        SimpleMappedFileQueue queue = new SimpleMappedFileQueue(storePath, fileSize);
+        File dir = new File(storePath);
+        File[] files = dir.listFiles();
+        if (files == null || files.length == 0) {
+            return queue;
+        }
+        Arrays.sort(files, Comparator.comparing(File::getName));
+        for (File file : files) {
+            if (!file.isFile()) {
+                continue;
+            }
+            long startOffset;
+            try {
+                startOffset = Long.parseLong(file.getName());
+            } catch (NumberFormatException e) {
+                continue;
+            }
+            SimpleMappedFile mappedFile = new SimpleMappedFile(file.getPath(), fileSize, startOffset);
+            int wrote = mappedFile.recoverKeyIndexWrotePosition();
+            if (wrote > 0 || queue.mappedFiles.isEmpty()) {
+                queue.mappedFiles.add(mappedFile);
+            } else {
+                mappedFile.close();
+            }
+        }
+        return queue;
+    }
+
+    /**
      * 获取最后一个映射文件，必要时创建新文件
      *
      * @param createIfAbsent true 且不存在时创建新文件

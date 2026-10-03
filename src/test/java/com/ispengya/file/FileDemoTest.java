@@ -11,7 +11,9 @@ import com.ispengya.file.store.RecordStore;
 import junit.framework.Assert;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TestName;
 
 import java.io.File;
 import java.time.Instant;
@@ -19,6 +21,14 @@ import java.util.List;
 
 
 public class FileDemoTest {
+
+    /**
+     * 每个用例使用独立的存储目录:
+     * Windows 下 mmap 无法在关闭后立刻解锁删除,共享目录会造成跨用例数据污染
+     */
+    @Rule
+    public TestName testName = new TestName();
+
     private SequentialLog log;
     private SimpleConsumeQueue consumeQueue;
     private KeyIndexFile keyIndexFile;
@@ -27,15 +37,12 @@ public class FileDemoTest {
 
     @Before
     public void setUp() throws Exception {
-//        clearDir("./docs/file-demo-data-test");
-//        clearDir("./docs/file-demo-cq-test");
-//        clearDir("./docs/file-demo-key-index-test");
-//        clearDir("./docs/file-demo-checkpoint-test");
-        SequentialLogConfig config = new SequentialLogConfig("./docs/file-demo-data-test", 1024 * 1024 * 8, true);
-        consumeQueue = new SimpleConsumeQueue("./docs/file-demo-cq-test", 1024 * 1024, true);
-        keyIndexFile = new KeyIndexFile("./docs/file-demo-key-index-test", 1024 * 1024);
+        String method = testName.getMethodName();
+        SequentialLogConfig config = new SequentialLogConfig("./docs/file-demo-" + method + "-data", 1024 * 1024 * 8, true);
+        consumeQueue = new SimpleConsumeQueue("./docs/file-demo-" + method + "-cq", 1024 * 1024, true);
+        keyIndexFile = new KeyIndexFile("./docs/file-demo-" + method + "-key-index", 1024 * 1024);
         log = new MmapSequentialLog(config);
-        checkpoint = new RecordStore.StoreCheckpoint("./docs/file-demo-checkpoint-test/checkpoint.dat");
+        checkpoint = new RecordStore.StoreCheckpoint("./docs/file-demo-" + method + "-checkpoint/checkpoint.dat");
         store = new RecordStore<>(log, new LogRecordCodec(), consumeQueue, checkpoint);
     }
 
@@ -166,6 +173,8 @@ public class FileDemoTest {
     @Test
     public void testRecoverCommitLogAfterRestart() throws Exception {
         String baseDir = "./docs/file-demo-recover-data-test";
+        clearDir(baseDir);
+        clearDir(baseDir + "-cq");
         SequentialLogConfig config1 = new SequentialLogConfig(baseDir, 1024 * 1024, true);
         SequentialLog log1 = new MmapSequentialLog(config1);
         SimpleConsumeQueue cq1 = new SimpleConsumeQueue(baseDir + "-cq", 1024 * 1024);
@@ -208,6 +217,8 @@ public class FileDemoTest {
     public void testRecoverConsumeQueueAfterRestart() throws Exception {
         String dataDir = "./docs/file-demo-recover-cq-data-test";
         String cqDir = "./docs/file-demo-recover-cq-test";
+        clearDir(dataDir);
+        clearDir(cqDir);
         SequentialLogConfig config1 = new SequentialLogConfig(dataDir, 1024 * 1024, true);
         SequentialLog log1 = new MmapSequentialLog(config1);
         SimpleConsumeQueue cq1 = new SimpleConsumeQueue(cqDir, 1024 * 1024);

@@ -148,6 +148,33 @@ public class SimpleMappedFile {
     }
 
     /**
+     * 扫描 KeyIndex 文件恢复写入位置
+     * 按 16 字节 [keyHash][physicalOffset] 单元逐条校验:
+     * 遇到全零空洞或非法 physicalOffset 即停止,后续追加从有效区尾部继续
+     *
+     * @return 恢复出的写入位置
+     */
+    public int recoverKeyIndexWrotePosition() {
+        int position = 0;
+        ByteBuffer buffer = this.mappedByteBuffer.slice();
+        while (position + 16 <= this.fileSize) {
+            buffer.position(position);
+            long keyHash = buffer.getLong();
+            long physicalOffset = buffer.getLong();
+            if (keyHash == 0L && physicalOffset == 0L) {
+                break;
+            }
+            if (physicalOffset < 0) {
+                break;
+            }
+            position += 16;
+        }
+        this.wrotePosition.set(position);
+        this.flushedPosition.set(position);
+        return position;
+    }
+
+    /**
      * 从指定文件内偏移位置读取一段数据，不改变写入位置
      *
      * @param position 文件内起始偏移
