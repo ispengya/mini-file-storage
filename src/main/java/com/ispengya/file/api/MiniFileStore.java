@@ -20,7 +20,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>构造顺序与生命周期(启动恢复 → 运行 → 关闭)对齐 RecordStore 的设计:</p>
  *
  * <ol>
- *   <li>CommitLog:{@link MmapSequentialLog} 构造时按 [length][payload] 扫描恢复写位置</li>
+ *   <li>CommitLog:{@link MmapSequentialLog} 构造时按 {@code RecordFrame} 帧协议(v2)扫描恢复写位置,并对脏尾置零</li>
  *   <li>ConsumeQueue:按 20 字节单元扫描恢复索引尾部,新索引在有效区后追加</li>
  *   <li>KeyIndex:按 16 字节单元扫描恢复追加位置(读到全零空洞即停止)</li>
  *   <li>Checkpoint:记录 CommitLog / ConsumeQueue 最近一次刷盘偏移</li>
@@ -62,7 +62,7 @@ public class MiniFileStore<T> implements FileStore<T> {
 
         this.consumeQueue = cq;
         this.keyIndexFile = keyIndex;
-        this.recordStore = new RecordStore<>(log, codec, cq, checkpoint);
+        this.recordStore = new RecordStore<>(log, codec, cq, checkpoint, config.getMaxBodySize());
     }
 
     @Override

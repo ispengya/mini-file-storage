@@ -12,6 +12,7 @@ public class StoreConfig {
     public static final int DEFAULT_COMMIT_LOG_FILE_SIZE = 8 * 1024 * 1024;
     public static final int DEFAULT_CONSUME_QUEUE_FILE_SIZE = 200 * 1024;
     public static final int DEFAULT_KEY_INDEX_FILE_SIZE = 64 * 1024;
+    public static final int DEFAULT_MAX_BODY_SIZE = 1024 * 1024;
 
     /**
      * 存储根目录
@@ -33,6 +34,10 @@ public class StoreConfig {
      * 是否同步刷盘(每次 append 后立即 flush)
      */
     private final boolean syncFlush;
+    /**
+     * 单条记录 body 上限,防止脏 bodyLen 造成巨帧
+     */
+    private final int maxBodySize;
 
     private StoreConfig(Builder builder) {
         this.baseDir = builder.baseDir;
@@ -40,6 +45,7 @@ public class StoreConfig {
         this.consumeQueueFileSize = builder.consumeQueueFileSize;
         this.keyIndexFileSize = builder.keyIndexFileSize;
         this.syncFlush = builder.syncFlush;
+        this.maxBodySize = builder.maxBodySize;
     }
 
     public static Builder builder(String baseDir) {
@@ -64,6 +70,13 @@ public class StoreConfig {
 
     public boolean isSyncFlush() {
         return syncFlush;
+    }
+
+    /**
+     * 单条记录 body 上限
+     */
+    public int getMaxBodySize() {
+        return maxBodySize;
     }
 
     /**
@@ -109,6 +122,7 @@ public class StoreConfig {
         private int consumeQueueFileSize = DEFAULT_CONSUME_QUEUE_FILE_SIZE;
         private int keyIndexFileSize = DEFAULT_KEY_INDEX_FILE_SIZE;
         private boolean syncFlush = false;
+        private int maxBodySize = DEFAULT_MAX_BODY_SIZE;
 
         private Builder(String baseDir) {
             if (baseDir == null || baseDir.trim().isEmpty()) {
@@ -140,7 +154,18 @@ public class StoreConfig {
             return this;
         }
 
+        public Builder maxBodySize(int maxBodySize) {
+            checkPositive(maxBodySize, "maxBodySize");
+            this.maxBodySize = maxBodySize;
+            return this;
+        }
+
         public StoreConfig build() {
+            if (maxBodySize + com.ispengya.file.core.RecordFrame.HEADER_SIZE > commitLogFileSize) {
+                throw new IllegalArgumentException(
+                        "maxBodySize + frame header must fit within a single commitLog file ("
+                                + commitLogFileSize + " bytes)");
+            }
             return new StoreConfig(this);
         }
 

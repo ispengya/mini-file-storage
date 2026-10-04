@@ -111,22 +111,46 @@ public class SimpleMappedFile {
         this.flushedPosition.set(position);
     }
 
+    /**
+     * 按 RecordFrame(v2)协议扫描恢复写入位置
+     *
+     * <p>逐帧解析:合法帧推进整帧;NOT_MATCHED(非帧起点/空间不足/bodyLen 脏值)
+     * 或 CORRUPTED(magic 完好但 CRC 不符,即断电页撕裂)均停止推进——
+     * 这是与 v1"只看 length 结构"的本质区别:内容损坏不再被静默放行。</p>
+     *
+     * <p>停止后对 [停点, 停点+4KB) 做脏尾清除:存在非零字节则整段置零并立即 force,
+     * 避免半条记录残留盘上(Java 无法对 mmap 中的文件安全 truncate,置零等效)。</p>
+     *
+     * @return 恢复出的写入位置(最后一条完整帧的结束位置)
+     */
     public int recoverRecordStoreWrotePosition() {
         int position = 0;
         ByteBuffer buffer = this.mappedByteBuffer.slice();
-        while (position + 4 <= this.fileSize) {
-            buffer.position(position);
-            int length = buffer.getInt();
-            if (length <= 0) {
+        while (true) {
+            RecordFrame.Frame frame = RecordFrame.parse(
+                    buffer, position, this.fileSize - position, Integer.MAX_VALUE);
+            if (frame.getStatus() != RecordFrame.Status.OK) {
                 break;
             }
-            if (position + 4 + length > this.fileSize) {
-                break;
-            }
-            position += 4 + length;
+            position += frame.getTotalLen();
         }
         this.wrotePosition.set(position);
         this.flushedPosition.set(position);
+
+        int clearTo = Math.min(position + 4096, this.fileSize);
+        boolean dirtyTail = false;
+        for (int i = position; i < clearTo; i++) {
+            if (buffer.get(i) != 0) {
+                dirtyTail = true;
+                break;
+            }
+        }
+        if (dirtyTail) {
+            for (int i = position; i < clearTo; i++) {
+                buffer.put(i, (byte) 0);
+            }
+            this.mappedByteBuffer.force();
+        }
         return position;
     }
 

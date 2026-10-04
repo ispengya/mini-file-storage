@@ -38,6 +38,12 @@ public class FileDemoTest {
     @Before
     public void setUp() throws Exception {
         String method = testName.getMethodName();
+        // 跨 JVM 尽力清理旧目录:格式 v2 一刀切弃读旧数据,首轮运行必须删掉 v1 残留
+        // (上一轮 JVM 退出后 mmap 锁已释放,删除可以成功;同轮内各用例目录名不同,互不干扰)
+        clearDir("./docs/file-demo-" + method + "-data");
+        clearDir("./docs/file-demo-" + method + "-cq");
+        clearDir("./docs/file-demo-" + method + "-key-index");
+        clearDir("./docs/file-demo-" + method + "-checkpoint");
         SequentialLogConfig config = new SequentialLogConfig("./docs/file-demo-" + method + "-data", 1024 * 1024 * 8, true);
         consumeQueue = new SimpleConsumeQueue("./docs/file-demo-" + method + "-cq", 1024 * 1024, true);
         keyIndexFile = new KeyIndexFile("./docs/file-demo-" + method + "-key-index", 1024 * 1024);

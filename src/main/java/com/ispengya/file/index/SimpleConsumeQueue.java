@@ -28,6 +28,12 @@ public class SimpleConsumeQueue implements AutoCloseable {
         }
     }
 
+    /**
+     * 追加一条 20 字节索引单元
+     *
+     * @param size CommitLog 中该记录的帧总长(RecordFrame.HEADER_SIZE + bodyLen),
+     *             与恢复扫描的推进量同源;v1 时代的"4 字节头 + payload"语义已随格式 v2 废弃
+     */
     public synchronized void append(long physicalOffset, int size, long tagCode) {
         byte[] unit = new byte[CQ_STORE_UNIT_SIZE];
         ByteBuffer buffer = ByteBuffer.wrap(unit);
