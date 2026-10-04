@@ -15,7 +15,10 @@ mini-file-storage 是一个 **零第三方依赖(仅 JDK)** 的迷你顺序存�
 | 帧自校验 | magic + CRC32 覆盖帧头与内容,恢复扫描遇撕裂帧/静默损坏必停,读取抛 `StoreCorruptedException` |
 | 脏尾清除 | 恢复扫描停止后,停点后 4KB 窗口内的残留字节置零落盘 |
 | 进程独占锁 | 同一 `baseDir` 双开直接被 `.store.lock` 拒绝(`StoreLockHeldException`) |
+| Reput 异步索引 | put 只写 CommitLog,ConsumeQueue/KeyIndex 由后台线程按帧头回放构建 |
+| 一致性分级 | `IndexMode.SYNC`(默认,put 等索引追平)/ `ASYNC`(最终一致 + `awaitIndexed` 显式升级) |
 | 重启恢复(CommitLog / ConsumeQueue / KeyIndex 均扫描恢复追加位置) | 相同 `StoreConfig` 重新打开 |
+| 索引可重建不变式 | 删除索引目录与 checkpoint 后重开,全部查询结果自动恢复(由启动 catch-up 回放) |
 
 ### 快速开始(门面 API)
 
@@ -35,7 +38,7 @@ store.flush();
 store.close();
 ```
 
-对象与字节的互转通过 `Codec<T>` 注入(内置 `LogRecordCodec` 示例)。完整行为见单元测试 `MiniFileStoreTest`。
+对象与字节的互转通过 `Codec<T>` 注入(内置 `LogRecordCodec` 示例)。默认 `SYNC` 模式下 put 返回即索引可见;吞吐优先可用 `indexMode(ASYNC)` + `awaitIndexed` 显式控制一致性(见下文"整体流程图 → 一致性速查")。完整行为参考单元测试 `MiniFileStoreTest` / `ReputConsistencyTest`。
 
 以下章节展开磁盘格式与内部机制,用于理解门面背后的实现。本工程最初是一组演示:
 
@@ -44,6 +47,68 @@ store.close();
 - 如何用一个固定长度的逻辑索引（ConsumeQueue）实现按逻辑 offset 访问;
 - 如何用一个简单的 KeyIndex 文件按 key 查询;
 - 如何用 checkpoint 记录刷盘位置，并在重启时做最基本的恢复。
+
+---
+
+## 整体流程图（Reput 异步模型）
+
+### 写路径:一次 put 的旅程
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as 业务线程
+    participant F as MiniFileStore 门面
+    participant L as CommitLog(唯一真相源)
+    participant R as Reput 线程(独立锁)
+    participant I as CQ / KeyIndex(派生视图)
+    participant C as Checkpoint(水位)
+
+    B->>F: put(value [, tag | key])
+    F->>L: 组帧(storeTs/tagCode/keyHash/CRC) 同步 append
+    L-->>F: 帧起始 offset
+    F->>R: signal()
+    alt SYNC 模式(默认)
+        F->>R: awaitCovered(offset) 阻塞等待
+        R->>I: ①KeyIndex.put(先,容忍重复)
+        R->>I: ②CQ.append(后,精确自时钟)
+        R->>R: ③游标越过该帧 + notifyAll
+        R-->>F: 索引就绪
+        F-->>B: 返回(索引立即可见)
+    else ASYNC 模式
+        F-->>B: 立即返回(索引最终一致)
+        R->>I: 稍后异步回放 ①②③
+        B->>F: 需要强一致时 awaitIndexed(offset, timeout)
+    end
+    B->>F: flush()
+    F->>L: force 数据
+    F->>I: force 索引
+    F->>C: save(logMax, cqMax, cqCursor, keyCursor)
+    Note over F,C: 顺序即协议:水位永远滞后但真实
+```
+
+### 启动路径:打开即自愈
+
+```mermaid
+flowchart TD
+    A["new MiniFileStore(config)"] --> B{"抢 baseDir/.store.lock"}
+    B -- 失败 --> X["StoreLockHeldException<br/>(单写者前提,直接拒绝)"]
+    B -- 成功 --> C["三类文件扫描恢复写位置<br/>帧协议(magic+CRC) / 20B 单元 / 16B 单元"]
+    C --> D["交叉校验:CQ 尾部<br/>off+size > 数据真相 的撒谎条目 → 截断"]
+    D --> E["游标初始化<br/>cqCursor = CQ 自时钟(精确)<br/>keyCursor = min(checkpoint 提示, cqCursor)"]
+    E --> F["catch-up 同步回放到日志合法尾<br/>冷启动补索引 = 崩溃自愈 = 删目录重建"]
+    F --> G["启动 mini-reput 后台线程"]
+    G --> H["可服务"]
+```
+
+### 一致性速查
+
+| 读方法 | SYNC(默认) | ASYNC |
+|---|---|---|
+| `get(offset)` 物理点读 | 强一致 | 强一致(只碰真相源) |
+| `getByLogicalIndex` / `getByKey` / `queryByTagRange` | 强一致(put 已等) | 最终一致,`awaitIndexed` 升级 |
+
+> **可重建不变式**(有专门测试):删除 `consumequeue/`、`keyindex/` 与 checkpoint 文件,重开后全部索引查询结果与删除前一致——索引是缓存,CommitLog 才是本体。
 
 ---
 
@@ -207,127 +272,62 @@ store.close();
 
 ---
 
-### 5. StoreCheckpoint：刷盘检查点
+### 5. StoreCheckpoint：水位检查点（v2 双槽原子）
 
 - 对应类：
-  - `RecordStore.StoreCheckpoint`（内部静态类）
+  - `store.StoreCheckpoint`（独立类；v1 为 RecordStore 内部类，已废弃）
 
-- 文件格式：
+- 文件格式：**两个 44 字节槽交替覆写**（文件固定 88 字节），单槽布局：
 
-| 顺序 | 字段                 | 长度（字节） | 类型  | 说明                                        |
-|------|----------------------|--------------|-------|---------------------------------------------|
-| 1    | commitLogMaxOffset   | 8            | long  | 最近一次 flush 后 CommitLog 的最大物理 offset |
-| 2    | consumeQueueMaxOffset| 8            | long  | 最近一次 flush 后 ConsumeQueue 的最大索引字节 offset |
+| 偏移 | 长度 | 字段          | 说明                                        |
+|------|------|---------------|---------------------------------------------|
+| 0    | 4    | magic         | `0x43503201`（"CP2"），旧 16B 格式无 magic 视为不可用 |
+| 4    | 4    | seq           | 单调递增；save 写"落后槽"，seq = max+1       |
+| 8    | 8    | logFlushMax   | CommitLog 已 flush 的最大物理 offset          |
+| 16   | 8    | cqFlushMax    | CQ 文件已 flush 字节位点（-1 = 无 CQ）        |
+| 24   | 8    | cqCursor      | Reput 已建索引到的日志位点（-1 = 不适用）      |
+| 32   | 8    | keyCursor     | Reput 已建 KeyIndex 到的位点（-1 = 不适用）    |
+| 40   | 4    | crc           | 覆盖前 40 字节                                |
 
-写入流程（`save`）：
-
-1. 确保目录存在；
-2. 分配 16 字节 ByteBuffer；
-3. 顺序写入两个 long；
-4. `RandomAccessFile` 设置文件长度为 16 字节，写入并 `force(true)`。
-
-读取流程（`load`）：
-
-1. 文件不存在或长度小于 16 字节，返回 null；
-2. 读取 16 字节并解析两个 long，返回 `[commitLogMaxOffset, consumeQueueMaxOffset]`。
+- **为什么要双槽**：v1 的 16B 原地覆写切在断电中间会产出"每个字段都合法、组合却是假的"的杂交水位——这也是 v1 时代 checkpoint 不敢被恢复消费的原因。双槽交替保证任何时刻至少一槽完整，`load()` 校验 magic+CRC 后取 seq 大的槽；两槽全坏返回 null，调用方退化为"文件自推导"。
+- **消费方**：启动时 `keyCursor` 提示 Reput 从哪续（与 CQ 自时钟取 min，重叠区靠读去重消化）；`logFlushMax` 保留给未来的"checkpoint 驱动扫描起点"（当前恢复仍全量扫，属已知成本）。
+- 不变式由写入顺序保证：**checkpoint ≤ 索引 ≤ 数据**（flush 按此顺序 force，水位最后写），水位永远"滞后但真实"。
 
 ---
 
-## 二、启动调用链路（按生命周期）
+## 二、生命周期与调用链路（Reput 异步模型）
 
-下面按“启动 → 写入 → 查询 → 关闭/重启”的顺序描述主要调用链。
+### 1. 启动阶段（门面模式，`new MiniFileStore<>(config, codec)`）
 
-### 1. 启动阶段
+1. **抢进程锁**：`baseDir/.store.lock` `tryLock`，失败抛 `StoreLockHeldException`——单写者前提从此有人守；
+2. **三类文件扫描恢复**：CommitLog 按帧协议（含脏尾置零）、ConsumeQueue 按 20B 单元、KeyIndex 按 16B 单元；
+3. **交叉校验**：`cq.truncateBeyond(log.maxOffset)` 从尾部弹掉"指向未落盘数据"的撒谎索引条目（断电时设备可能乱序落盘，CQ 页留下而数据页丢失是真实场景）；
+4. **游标初始化**：`cqCursor` 取 CQ 自时钟（最后条目的 off+size，精确）；`keyCursor` 取 `min(checkpoint 提示, cqCursor)`（保守下界）；
+5. **catch-up 同步回放**：Reput 从游标追到日志合法尾——**冷启动补索引、崩溃自愈、删索引目录后全量重建共用这一段代码**；
+6. 启动后台 `mini-reput` 线程（daemon）。
 
-典型构造过程（以 `FileDemoTest.setUp` 为例）：
+> legacy 手工装配路径（`FileDemoTest` 直接 new 组件、`RecordStore` 内联写 CQ）仍保留，标记 @Deprecated；新代码一律走门面。
 
-1. 创建顺序日志：
-   - `SequentialLogConfig config = new SequentialLogConfig(dataDir, fileSize, syncFlush);`
-   - `SequentialLog log = new MmapSequentialLog(config);`
-   - 内部调用：
-     - `SimpleMappedFileQueue.recoverForRecordStore(storePath, fileSize)` 扫描已有 CommitLog 文件；
-     - 每个文件调用 `recoverRecordStoreWrotePosition` 计算有效 wrotePosition。
-2. 创建 ConsumeQueue：
-   - 首次启动：`new SimpleConsumeQueue(cqDir, fileSize);`（空目录）；
-   - 重启恢复：`new SimpleConsumeQueue(cqDir, fileSize, true);`
-     - 内部调用 `SimpleMappedFileQueue.recoverForConsumeQueue`；
-     - 每个索引文件调用 `recoverConsumeQueueWrotePosition` 找到有效索引尾部。
-3. 创建 KeyIndexFile（可选）：
-   - 首次启动：`new KeyIndexFile(keyDir, fileSize);`；
-   - 重启恢复：`new KeyIndexFile(keyDir, fileSize, true);`
-     - 按 16 字节单元顺序扫描已有文件恢复追加位置，遇到全零空洞即停止；
-     - 门面 `MiniFileStore` 默认使用 recover=true。
-4. 创建 checkpoint：
-   - `StoreCheckpoint checkpoint = new StoreCheckpoint(checkpointPath);`
-5. 构造 RecordStore：
-   - `RecordStore<LogRecord> store = new RecordStore<>(log, new LogRecordCodec(), consumeQueue, checkpoint);`
+### 2. 写入链路（put 只碰真相源）
 
-### 2. 写入链路
-
-以写入一条 LogRecord 为例：
-
-1. 业务构造 `LogRecord(ts, level, msg)`；
-2. 调用 `store.append(record, tagCode)`，其中 mini 中通常让 `tagCode = timestamp`；
-3. `RecordStore.append`：
-   - `LogRecordCodec.encode` 生成 body；
-   - `RecordFrame.encode` 组帧（36B 帧头盖 storeTimestamp/tagCode/keyHash + CRC + body）；
-   - 调用 `log.append(frameBytes)` 写入 CommitLog；
-   - 拿到写入完成后的 `maxOffset`，计算该帧的 `recordOffset = maxOffset - frameBytes.length`；
-   - 调用 `consumeQueue.append(recordOffset, frameBytes.length, tagCode)` 生成逻辑索引（size=帧总长，与恢复推进量同源）；
-4. 调用 `store.flush()`：
-   - `log.flush()`：
-     - `SimpleMappedFileQueue.flush()` 遍历所有文件并 `force()`；
-   - `consumeQueue.flush()`：
-     - `SimpleMappedFileQueue.flush()` 刷索引文件；
-   - `checkpoint.save(commitLogMaxOffset, consumeQueueMaxOffset)` 记录刷盘位置。
+1. `put(value[, tag|key])` → `RecordStore.append`：encode body → `RecordFrame.encode` 盖 storeTimestamp/tagCode/keyHash/CRC → `log.append` 写 CommitLog → 返回帧起始 offset；
+2. `reput.signal()` 唤醒后台线程；
+3. **SYNC（默认）**：put 内 `awaitCovered(offset)` 等本帧索引建完才返回——对外强一致，但索引写已移出用户线程的关键路径；
+   **ASYNC**：立即返回，索引读需 `awaitIndexed(offset, timeout)` 显式升级；
+4. Reput 对每帧固定顺序：**① keyHash≠0 先 KeyIndex.put → ② 后 CQ.append → ③ 游标推进 + notify**。顺序不可反：CQ 是精确自时钟，必须最后写——否则断点会留下"CQ 已越过、key 永久缺失"的缺口；按此顺序最坏只产生 key 重复，读侧去重消化；
+5. `flush()` 按**数据 → 索引 → 水位**顺序 force 并 `checkpoint.save(4 水位)`（checkpoint 写最后 ⇒ 只保守不超前）。
 
 ### 3. 查询链路
 
-- 按物理 offset 查询（`testAppendAndReadByPhysicalOffset`）：
-
-1. 业务持有物理 offset（`recordOffset`）；
-2. 调用 `store.read(recordOffset)`：
-   - 从 CommitLog 读取 36 字节帧头，取 bodyLen；
-   - 读取整帧，`RecordFrame.parse` 校验 magic + CRC；
-   - 通过则 `LogRecordCodec.decode` 还原 body，损坏则抛 `StoreCorruptedException`；
-
-- 按逻辑 offset 查询（`testReadByLogicalOffset`）：
-
-1. 业务只关心“第 N 条消息”，传入 `logicalOffset = N`；
-2. 调用 `store.readByLogicalOffset(logicalOffset)`：
-   - `SimpleConsumeQueue.get(logicalOffset)` 读取一条索引；
-   - 得到 `physicalOffset` 和 `size`；
-   - 再调用 `read(physicalOffset)` 读取真实记录。
-
-- 按时间范围查询（`testQueryByTimeRange`）：
-
-1. 确定 `beginTs`、`endTs`；
-2. 调用 `store.queryByTimeRange(beginTs, endTs)`：
-   - 从逻辑 offset 0 开始顺序遍历 ConsumeQueue：
-     - 读取每条索引中的 `tagCode`（这里就是 timestamp）；
-     - 如果 < beginTs，跳过继续；
-     - 如果 > endTs，停止扫描；
-     - 命中范围则根据 `physicalOffset` 读取对应记录并加入结果列表。
-
-- 按 key 查询（`testKeyIndexQuery`）：
-
-1. 写入时，业务将 key 的 hash 与物理 offset 写入 `KeyIndexFile`：
-   - `long keyHash = key.hashCode() & 0xffffffffL;`
-   - `keyIndexFile.put(keyHash, physicalOffset);`
-2. 查询时，调用 `keyIndexFile.get(keyHash)`：
-   - 顺序扫所有索引条目，收集 `storedKeyHash == keyHash` 的 `physicalOffset`；
-   - 对每个 offset 调用 `store.read(offset)`，并校验 message 是否匹配。
+- `get(offset)`：CommitLog 帧头 → bodyLen → 整帧 → magic+CRC 校验 → decode。只读真相源，**任何模式强一致**；
+- `getByLogicalIndex(n)`：CQ `n×20` 定位 → 回表 get（ASYNC 下最终一致，或先 await）；
+- `queryByTagRange(b,e)`：顺序扫 CQ tagCode，`<b` 跳过、`>e` 截断（依赖 tag 单调写入的前提）；
+- `getByKey(key)`：KeyIndex 全表扫 hash 命中 offset 集合 → **LinkedHashSet 去重**（回放重叠产物）→ 逐个回表；语义是候选集，hash 冲突需业务自校验。
 
 ### 4. 关闭与重启
 
-- 关闭（`RecordStore.close`）：
-  - 调用 `flush()`，确保 CommitLog 和 ConsumeQueue 以及 checkpoint 都刷盘；
-  - 关闭顺序日志和 ConsumeQueue。
-
-- 重启：
-  - `MmapSequentialLog` 重建文件队列并按帧协议(magic+bodyLen+CRC)扫描校正 wrotePosition，停点后的脏尾窗口置零清除；
-  - `SimpleConsumeQueue(..., true)` 重建索引文件队列并按 `[offset][size][tagCode]` 扫描校正 wrotePosition；
-  - 新写入会从这些有效区域的尾部继续 append，不覆盖旧数据。
+- `close()`：`reput.stopAndDrain()`（停线程 + 调用线程收尾回放到最新）→ `flushAll()` → 关 CQ/KeyIndex/日志组件 → 释放进程锁。**ASYNC 下 close 保证不欠账**（有回归测试）；
+- 重启：见"启动阶段"五步——同一套扫描+校验+catch-up,任意断点对恢复都是安全的。
 
 ---
 
@@ -337,9 +337,10 @@ store.close();
 |-----------------|---------------------------------------------------------------------|
 | CommitLog       | `[36B 帧头(magic/bodyLen/storeTs/tagCode/keyHash/CRC)][body]`        |
 | LogRecord payload | `[8 ts][4 levelLen][levelBytes][4 msgLen][msgBytes]`            |
-| ConsumeQueue    | `[8 physicalOffset][4 size][8 tagCode]`                            |
+| ConsumeQueue    | `[8 physicalOffset][4 size][8 tagCode]`（size=帧总长）               |
 | KeyIndexFile    | `[8 keyHash][8 physicalOffset]`                                     |
-| StoreCheckpoint | `[8 commitLogMaxOffset][8 consumeQueueMaxOffset]`                  |
+| StoreCheckpoint | 88B 双槽文件，每槽 `[magic][seq][4×水位][crc]`（v2 原子交替）        |
+| .store.lock     | 空文件，仅作进程独占锚（内容无意义，永不删除）                       |
 
 ---
 
@@ -397,46 +398,19 @@ store.close();
    - 时间范围查询；
    - key 查询；
    - 重启恢复场景。
-4. 按前面“待改进点”的表格，挑一两项动手增强 mini，例如：
-   - ~~为记录增加 CRC 和魔数~~（已实现：帧格式 v2，见"一、1. CommitLog"）；
-   - 为 ConsumeQueue 增加与 CommitLog 的一致性校验；
-   - 为 KeyIndexFile 增加简单的 hash 槽结构；
-   - 加一个真正的“从 checkpoint 起点往后重放”的重建方法。
+4. 对照"待改进点"表格动手增强，当前状态一览：
+   - ~~为记录增加 CRC 和魔数~~（已实现：帧格式 v2）；
+   - ~~Reput 回放重建索引~~（已实现：`ReputService` + 启动 catch-up，删索引目录可重建）；
+   - ~~Checkpoint 双槽原子 + 被启动流程消费~~（已实现：v2 四水位；剩余——用 `logFlushMax` 缩小数据扫描起点）；
+   - 待做：ConsumeQueue 恢复时的帧级 CRC 全量交叉校验（当前只做尾部截断）；
+   - 待做：KeyIndexFile hash 槽结构（替代线性扫描）；
+   - 待做：独立 FlushService 异步刷盘线程、过期文件删除与磁盘水位、munmap。
 
 这样，这个 mini 就不仅仅是“能跑的 demo”，而是你可以不断对标 RocketMQ 存储实现、逐步演进的实验场。
-  - mini 的改进点：
-    - 可以参考 RocketMQ，对 KeyIndexFile 增加简单的头部/长度校验和启动截断逻辑；
-    - 在未来若实现简易 Reput，也可以顺带重放生成 KeyIndex 索引。
 
-- Checkpoint / Reput 服务
-  - RocketMQ 的恢复策略：
-    - 独立的 Checkpoint 文件记录 CommitLog/ConsumeQueue/IndexFile 的刷盘时间戳；
-    - 启动时先恢复 Checkpoint，再根据其中的时间戳决定：
-      - 从哪个 CommitLog 文件开始扫描；
-      - 从哪里开始向 ConsumeQueue/IndexFile 做重放；
-    - Reput 服务常驻，负责将 CommitLog 新写入的数据“回放”到 ConsumeQueue 和 IndexFile 中。
-  - RocketMQ 的重建策略：
-    - 如果某一类索引文件被删除，只要 Checkpoint 和 CommitLog 还在，就能通过 Reput 从 Checkpoint 指定的位置开始重建；
-    - 这样可以在不影响 CommitLog 完整性的前提下，逐步修复所有索引。
-  - mini 当前实现：
-    - `RecordStore.StoreCheckpoint` 记录 CommitLog 与 ConsumeQueue 最新一次刷盘偏移；
-    - 目前主要用于示例“如何把偏移写到一个单独的小文件”，并未在启动时驱动实际恢复流程；
-    - 没有常驻的 Reput 服务，ConsumeQueue/KeyIndex 的写入都在 append 时直接完成。
-  - mini 的改进点（思路强化版）：
-    - 利用 `StoreCheckpoint` 缩小重放范围：
-      - 启动时先 `load()` 出最新一次刷盘的 `commitLogMaxOffset` 与 `consumeQueueMaxOffset`；
-      - 结合 CommitLog 启动扫描结果，计算出“从哪个物理位置开始需要重放”（例如从上次已索引到的物理 offset 之后开始）；
-      - 这样无需每次都从 0 重放整个 CommitLog，只处理“Checkpoint 之后的新数据”。
-    - 增加一个简化版 Reput 线程（或一次性重放过程）：
-      - 从上述“重放起点 offset”开始，顺序遍历 CommitLog：
-        - 解析出每条消息的物理 offset、长度以及业务字段（比如时间戳、key 等）；
-        - 为每条消息写入 ConsumeQueue：`(physicalOffset, size, tagCode)`，其中 `tagCode` 可以继续用时间戳；
-        - 可选地为每条消息写入 KeyIndex：`(keyHash, physicalOffset)`。
-      - 重放到当前 CommitLog 末尾后，再更新 `StoreCheckpoint` 中记录的偏移，表示“索引已经追平到哪个位置”。
-    - 后续可以进一步演进为常驻线程：
-      - 正常写入路径只负责把消息写入 CommitLog；
-      - 一个后台 Reput 线程基于 Checkpoint 持续“追尾”构建 ConsumeQueue/KeyIndex；
-      - 宕机重启时，依靠 CommitLog + Checkpoint + Reput，可以自动修复/重建大部分索引，使 mini 的整体恢复/重建流程更接近 RocketMQ。
+> 历史备注：本节曾整段描述"未来的 Checkpoint/Reput 服务应该怎么做"。该设计已在
+> `store/ReputService` + `store/StoreCheckpoint(v2)` 落地——启动生命周期与写入顺序见
+> "整体流程图"与"二、生命周期与调用链路"两节，原文不再保留以免误导。
 
 ---
 
@@ -454,9 +428,10 @@ store.close();
 | 按 Topic.Queue + offset 读 | 逻辑 offset → ConsumeQueue → CommitLog                    | `readByLogicalOffset` → `SimpleConsumeQueue` → `RecordStore.read`                  |
 | 按时间查询                | 结合 CommitLog 时间戳、文件名、tagCode/IndexFile          | 使用 `SimpleConsumeQueue` 的 tagCode 存时间戳，`queryByTimeRange` 顺序过滤         |
 | 按 key 查询               | IndexFile：hash 槽 + index entry 结构                     | 简化 `KeyIndexFile`：顺序存储 `[keyHash][physicalOffset]`，线性扫描                |
-| 刷盘策略                  | 同步/异步刷盘，多线程 flush/commit                        | `flush()` 直接调用底层 `MappedByteBuffer.force()`，支持配置 syncFlush              |
-| 宕机恢复                  | CommitLog 扫描 + ConsumeQueue 校验/截断 + Reput 重建索引  | 示例中具备扫描 + checkpoint 能力的基础设施（SimpleConsumeQueue + StoreCheckpoint） |
-| Checkpoint                | 独立 Checkpoint 文件记录多组件刷盘时间                    | `StoreCheckpoint` 记录 CommitLog / ConsumeQueue 已刷盘偏移                         |
+| 刷盘策略                  | 同步/异步刷盘，多线程 flush/commit                        | `flush()` 数据→索引→水位顺序 force，支持配置 syncFlush；独立 FlushService 未做     |
+| 索引构建                  | put 只写 CommitLog，Reput 线程回放构建 ConsumeQueue/IndexFile | ✅ 同模型：put 只写日志，`ReputService` 回放帧头构建 CQ/KeyIndex；SYNC/ASYNC 一致性分级 |
+| 宕机恢复                  | CommitLog 扫描 + ConsumeQueue 校验/截断 + Reput 重建索引  | 帧协议扫描(含脏尾清除) + CQ 交叉校验截断 + catch-up 回放重建，删索引目录可全量重建   |
+| Checkpoint                | 独立 Checkpoint 文件记录多组件刷盘时间                    | v2 双槽原子(4水位+seq+CRC)；keyCursor 提示已消费，logFlushMax 驱动扫描起点为剩余工作 |
 | 磁盘空间回收              | 定时删除过期 CommitLog/ConsumeQueue/IndexFile             | 未实现，只关注写入/读取和索引逻辑                                                  |
 | HA 与多副本               | 主从同步 CommitLog，支持高可用                            | 未实现                                                                             |
 | 事务、重试、顺序消息等    | 上层协议和存储配合实现                                    | 未实现，聚焦底层存储原理                                                          |
@@ -495,6 +470,11 @@ store.close();
   - `testRecoverCommitLogAfterRestart`：验证 CommitLog 基于文件扫描的启动恢复；
   - `testRecoverConsumeQueueAfterRestart`：验证 ConsumeQueue 启动恢复后在旧索引后继续追加并按逻辑 offset 读取；
   - `MiniFileStoreTest#restartRecoveryKeepsAllIndexTypes`：验证三类文件(数据/CQ/KeyIndex)重启后均可继续追加与读取。
+- 可靠性与异步测试（本次重构新增）：
+  - `CommitLogCorruptionTest`：撕裂帧恢复停位 / 读损坏抛错 / 双开拒绝 / 脏尾清零；
+  - `RebuildInvariantTest`：**删除 CQ/KeyIndex 目录与 checkpoint 后重开，全部索引查询自动重建一致**（唯一真相源契约）；
+  - `ReputServiceTest` / `ReputConsistencyTest`：回放顺序、awaitCovered 语义、close drain 不欠账、getByKey 去重；
+  - `ReputCheckpointTest` / `RecordFrameTest`：双槽原子、帧编解码三态判定。
 
 在模块根目录执行：
 
@@ -518,44 +498,35 @@ mvn test
 - 第三步：结合下面的“写入 / 读取 / 启动恢复 / 重放”流程图，建立模块之间的调用图像；
 - 第四步：最后对照 `FileDemoTest` / `MiniFileStoreTest` / `CommitLogCorruptionTest`，从测试验证自己对流程与损坏语义的理解。
 
-### 2. 写入流程（从业务对象到磁盘与索引）
-
-以 `RecordStore<LogRecord>.append(record, tagCode)` 为例：
+### 2. 写入流程（put 只写真相源，索引归 Reput）
 
 ```text
-业务代码
-  └─ RecordStore.append(value, tagCode)
-       ├─ Codec.encode(value)                           （对象 → payload）
-       ├─ RecordFrame.encode 组帧         （盖 storeTs/tagCode/keyHash + CRC）
-       ├─ SequentialLog.append(frameBytes)   （顺序写 CommitLog）
-       │    └─ MmapSequentialLog.append(...)
-       │         ├─ SimpleMappedFileQueue.getLastMappedFile(true)
-       │         │    └─ SimpleMappedFile.append(...)   （mmap 顺序写单个文件）
-       │         └─ fileQueue.getMaxOffset()            （返回当前最大物理 offset）
-       ├─ 计算 recordOffset = maxOffset - frameBytes.length
-       ├─ 如果配置了 ConsumeQueue:
-       │    └─ SimpleConsumeQueue.append(recordOffset, 帧总长, tagCode)
-       │         └─ SimpleMappedFileQueue.getLastMappedFile(true)
-       │              └─ SimpleMappedFile.append(20B 索引单元)
-       └─ 如果业务配置了 KeyIndex:
-            └─ KeyIndexFile.put(keyHash, recordOffset)
-                 └─ SimpleMappedFileQueue.getLastMappedFile(true)
-                      └─ SimpleMappedFile.append(16B 索引单元)
+业务线程（SYNC 模式在此等待索引）
+  └─ MiniFileStore.put(value[, tag | key])
+       ├─ RecordStore.append(value, tagCode, keyHash)
+       │    ├─ Codec.encode(value)                    （对象 → body）
+       │    ├─ RecordFrame.encode 组帧                （盖 storeTs/tagCode/keyHash + CRC）
+       │    └─ MmapSequentialLog.append(frameBytes)   （写 CommitLog，满则滚动）
+       ├─ reput.signal()                              （唤醒后台，put 关键路径到此为止）
+       └─ SYNC: reput.awaitCovered(offset)  ← ─ ─ ─ ─ ─ ┐ 两把锁不嵌套，无死锁
+                                                         │
+Reput 线程（mini-reput，独立 monitor）  ─ ─ ─ ─ ─ ─ ─ ─ ─┘
+  └─ 从 cqCursor 起逐帧回放 log 区间 [cqCursor, maxOffset)
+       ├─ RecordFrame.parse 校验 magic+CRC（坏帧停点，绝不越过）
+       ├─ ① keyHash != 0 → KeyIndexFile.put(keyHash, frameOffset)   先写"容忍重复"的
+       ├─ ② SimpleConsumeQueue.append(frameOffset, 帧总长, tagCode)  后写"精确自时钟"的
+       └─ ③ cqCursor += 帧总长; lock.notifyAll()                     顺序不可反
 ```
 
-刷盘/Checkpoint 写入：
+刷盘/Checkpoint（有序落盘协议）：
 
 ```text
-业务代码
-  └─ RecordStore.flush()
-       ├─ log.flush()
-       │    └─ MmapSequentialLog.flush()
-       │         └─ SimpleMappedFileQueue.flush()
-       │              └─ 遍历所有 SimpleMappedFile.flush() （MappedByteBuffer.force）
-       ├─ consumeQueue.flush() （如存在）
-       │    └─ SimpleMappedFileQueue.flush()
-       └─ checkpoint.save(commitLogMaxOffset, consumeQueueMaxOffset) （如配置）
-            └─ StoreCheckpoint.save(...) 写入 checkpoint 文件
+MiniFileStore.flush()/close()
+  ├─ recordStore.flush()   → log.force                    ① 数据
+  ├─ consumeQueue.flush()  → cq 文件 force                 ② 索引
+  ├─ keyIndexFile.flush()                                  ② 索引
+  └─ checkpoint.save(logMax, cqMax, reput.cqCursor, reput.keyCursor)  ③ 水位最后
+       → 不变式 checkpoint ≤ 索引 ≤ 数据：水位只可能滞后，绝不超前撒谎
 ```
 
 ### 3. 读取流程（按物理 offset / 逻辑 offset / 时间 / key）
@@ -616,28 +587,27 @@ mvn test
   └─ 对每个 candidate offset 调用 RecordStore.read(offset) 做最后校验
 ```
 
-### 4. 启动恢复流程（当前实现）
-
-这一节只描述当前代码中真实存在的启动恢复路径，围绕 CommitLog 与 ConsumeQueue 的 wrotePosition 校正。前文表格中提到的“基于 checkpoint 的一次性重放 / 后台 Reput 线程”等能力属于待改进方向，这里不再给出具体伪代码。
+### 4. 启动生命周期（Reput 模型，门面模式）
 
 ```text
-应用启动
-  ├─ 构造 MmapSequentialLog(config)
-  │    └─ SimpleMappedFileQueue.recoverForRecordStore(storePath, fileSize)
-  │         ├─ 扫描 data 目录下所有 CommitLog 文件
-  │         └─ 对每个文件调用 SimpleMappedFile.recoverRecordStoreWrotePosition()
-  │              └─ 按帧协议(magic+bodyLen+CRC)顺序扫描确定 wrotePosition，停点后 4KB 脏尾置零
-  │
-  ├─ 构造 SimpleConsumeQueue(cqPath, size, recover = true)
-  │    └─ SimpleMappedFileQueue.recoverForConsumeQueue(cqPath, fileSize)
-  │         ├─ 扫描 cq 目录下所有索引文件
-  │         └─ 对每个文件调用 SimpleMappedFile.recoverConsumeQueueWrotePosition()
-  │              └─ 按 20B 单元扫描，检查 offset>=0 && size>0
-  │
-  ├─ 构造 StoreCheckpoint(checkpointPath)
-  │    └─ 可选：调用 StoreCheckpoint.load() 读取历史偏移（当前实现尚未在恢复流程中主动使用）
-  │
-  └─ 构造 RecordStore(log, codec, consumeQueue, checkpoint)
+new MiniFileStore(config, codec)
+  ├─ ① 抢进程锁 baseDir/.store.lock
+  │    └─ tryLock==null / 同 JVM 重叠 → StoreLockHeldException（装配失败则释放锁再抛）
+  ├─ ② 三类文件扫描恢复
+  │    ├─ MmapSequentialLog → recoverForRecordStore：帧协议扫描 + 停点后 4KB 脏尾置零
+  │    ├─ SimpleConsumeQueue(recover=true) → 20B 单元扫描（off>=0 && size>0）
+  │    └─ KeyIndexFile(recover=true) → 16B 单元扫描（全零空洞即停）
+  ├─ ③ 交叉校验 cq.truncateBeyond(log.maxOffset)
+  │    └─ 弹掉"CQ 说数据在 X，数据真相只到 Y<X"的撒谎尾条目
+  ├─ ④ 游标初始化 reput.initCursors(cq.cqCursor(), min(checkpoint.keyCursor, cqCursor))
+  │    └─ CQ 自时钟精确；key 提示只能保守取下界，重叠区靠 getByKey 读去重消化
+  ├─ ⑤ catch-up 同步回放 reput.replayTo(log.maxOffset)
+  │    └─ 同一代码路径覆盖三种场景：冷启动补索引 / 崩溃自愈 / 索引目录被删后全量重建
+  └─ ⑥ 启动 daemon 线程 mini-reput 持续追尾
 ```
 
-通过这条启动恢复流程，你可以从“应用启动”一路追踪到 `SimpleMappedFile` 的扫描逻辑，理解 mini 当前实现如何在宕机后恢复 CommitLog 与 ConsumeQueue 的写入位置。  
+close 顺序与⑤呼应：`stopAndDrain`（停线程 + 调用线程收尾回放到最新）→ 有序落盘 → 关组件 → 放锁，
+保证 ASYNC 模式下"close 之后无欠账"——跨重启的索引读因此永远完整（ReputConsistencyTest 有回归用例）。
+
+历史注：v1 时代本节只有"扫描校正 wrotePosition"三步，索引一致性靠 put 内联双写硬扛；
+现在"追平"成为一等公民，恢复、重建、补账统一为 catch-up 一段代码。
