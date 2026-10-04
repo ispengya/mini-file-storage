@@ -10,6 +10,11 @@ import com.ispengya.file.store.RecordStore.StoreCheckpoint;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.nio.channels.OverlappingFileLockException;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -31,6 +36,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class MiniFileStore<T> implements FileStore<T> {
 
     private final StoreConfig config;
+    private final FileChannel lockChannel;
+    private final FileLock storeLock;
     private final RecordStore<T> recordStore;
     private final SimpleConsumeQueue consumeQueue;
     private final KeyIndexFile keyIndexFile;
@@ -38,36 +45,65 @@ public class MiniFileStore<T> implements FileStore<T> {
 
     public MiniFileStore(StoreConfig config, Codec<T> codec) {
         this.config = config;
-        mkdirs(config.commitLogPath());
-        mkdirs(config.consumeQueuePath());
-        mkdirs(config.keyIndexPath());
 
-        MmapSequentialLog log = new MmapSequentialLog(
-                new SequentialLogConfig(config.commitLogPath(), config.getCommitLogFileSize(), config.isSyncFlush()));
-
-        SimpleConsumeQueue cq;
+        // 进程级单实例互斥:先抢 .store.lock,失败立即拒绝,绝不带着双写风险继续装配
+        String lockPath = config.getBaseDir() + "/.store.lock";
+        mkdirs(config.getBaseDir());
+        FileChannel channel = null;
         try {
-            cq = new SimpleConsumeQueue(config.consumeQueuePath(), config.getConsumeQueueFileSize(), true);
+            channel = FileChannel.open(Paths.get(lockPath),
+                    StandardOpenOption.READ, StandardOpenOption.WRITE, StandardOpenOption.CREATE);
+            FileLock lock = channel.tryLock();
+            if (lock == null) {
+                closeQuietly(channel);
+                throw new StoreLockHeldException(lockPath);
+            }
+            this.lockChannel = channel;
+            this.storeLock = lock;
+        } catch (OverlappingFileLockException e) {
+            closeQuietly(channel);
+            throw new StoreLockHeldException(lockPath);
         } catch (IOException e) {
-            throw new IllegalStateException("recover consume queue failed: " + config.consumeQueuePath(), e);
+            closeQuietly(channel);
+            throw new IllegalStateException("open store lock failed: " + lockPath, e);
         }
 
-        KeyIndexFile keyIndex;
         try {
-            keyIndex = new KeyIndexFile(config.keyIndexPath(), config.getKeyIndexFileSize(), true);
-        } catch (IOException e) {
-            throw new IllegalStateException("recover key index failed: " + config.keyIndexPath(), e);
-        }
-        StoreCheckpoint checkpoint = new StoreCheckpoint(config.checkpointPath());
+            mkdirs(config.commitLogPath());
+            mkdirs(config.consumeQueuePath());
+            mkdirs(config.keyIndexPath());
 
-        this.consumeQueue = cq;
-        this.keyIndexFile = keyIndex;
-        this.recordStore = new RecordStore<>(log, codec, cq, checkpoint, config.getMaxBodySize());
+            MmapSequentialLog log = new MmapSequentialLog(
+                    new SequentialLogConfig(config.commitLogPath(), config.getCommitLogFileSize(), config.isSyncFlush()));
+
+            SimpleConsumeQueue cq;
+            try {
+                cq = new SimpleConsumeQueue(config.consumeQueuePath(), config.getConsumeQueueFileSize(), true);
+            } catch (IOException e) {
+                throw new IllegalStateException("recover consume queue failed: " + config.consumeQueuePath(), e);
+            }
+
+            KeyIndexFile keyIndex;
+            try {
+                keyIndex = new KeyIndexFile(config.keyIndexPath(), config.getKeyIndexFileSize(), true);
+            } catch (IOException e) {
+                throw new IllegalStateException("recover key index failed: " + config.keyIndexPath(), e);
+            }
+
+            StoreCheckpoint checkpoint = new StoreCheckpoint(config.checkpointPath());
+
+            this.consumeQueue = cq;
+            this.keyIndexFile = keyIndex;
+            this.recordStore = new RecordStore<>(log, codec, cq, checkpoint, config.getMaxBodySize());
+        } catch (RuntimeException | Error e) {
+            releaseLock();
+            throw e;
+        }
     }
 
     @Override
     public synchronized long put(T value) {
-        return recordStore.append(value, System.currentTimeMillis());
+        return recordStore.append(value);
     }
 
     @Override
@@ -78,8 +114,10 @@ public class MiniFileStore<T> implements FileStore<T> {
     @Override
     public synchronized long put(T value, String key) {
         checkKey(key);
-        long physicalOffset = recordStore.append(value, System.currentTimeMillis());
-        keyIndexFile.put(hashKey(key), physicalOffset);
+        long keyHash = hashKey(key);
+        // keyHash 随帧头落入 CommitLog(唯一真相源),KeyIndex 由此可重建
+        long physicalOffset = recordStore.append(value, System.currentTimeMillis(), keyHash);
+        keyIndexFile.put(keyHash, physicalOffset);
         return physicalOffset;
     }
 
@@ -126,6 +164,8 @@ public class MiniFileStore<T> implements FileStore<T> {
         if (closed.compareAndSet(false, true)) {
             keyIndexFile.close();
             recordStore.close();
+            // 组件全部落盘关闭后再释放进程锁,避免半关闭状态下被新实例接管
+            releaseLock();
         }
     }
 
@@ -147,6 +187,28 @@ public class MiniFileStore<T> implements FileStore<T> {
     private static void checkKey(String key) {
         if (key == null) {
             throw new IllegalArgumentException("key must not be null");
+        }
+    }
+
+    /**
+     * 释放文件锁与锁通道;锁文件本身保留(删除存在竞态,与 RocketMQ 同款处理)
+     */
+    private void releaseLock() {
+        try {
+            if (storeLock != null && storeLock.isValid()) {
+                storeLock.release();
+            }
+        } catch (IOException ignored) {
+        }
+        closeQuietly(lockChannel);
+    }
+
+    private static void closeQuietly(FileChannel channel) {
+        if (channel != null) {
+            try {
+                channel.close();
+            } catch (IOException ignored) {
+            }
         }
     }
 
