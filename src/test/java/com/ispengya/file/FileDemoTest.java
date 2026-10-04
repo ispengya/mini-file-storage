@@ -8,6 +8,7 @@ import com.ispengya.file.index.KeyIndexFile;
 import com.ispengya.file.index.SimpleConsumeQueue;
 import com.ispengya.file.model.LogRecord;
 import com.ispengya.file.store.RecordStore;
+import com.ispengya.file.store.StoreCheckpoint;
 import junit.framework.Assert;
 import org.junit.After;
 import org.junit.Before;
@@ -33,7 +34,7 @@ public class FileDemoTest {
     private SimpleConsumeQueue consumeQueue;
     private KeyIndexFile keyIndexFile;
     private RecordStore<LogRecord> store;
-    private RecordStore.StoreCheckpoint checkpoint;
+    private StoreCheckpoint checkpoint;
 
     @Before
     public void setUp() throws Exception {
@@ -48,7 +49,7 @@ public class FileDemoTest {
         consumeQueue = new SimpleConsumeQueue("./docs/file-demo-" + method + "-cq", 1024 * 1024, true);
         keyIndexFile = new KeyIndexFile("./docs/file-demo-" + method + "-key-index", 1024 * 1024);
         log = new MmapSequentialLog(config);
-        checkpoint = new RecordStore.StoreCheckpoint("./docs/file-demo-" + method + "-checkpoint/checkpoint.dat");
+        checkpoint = new StoreCheckpoint("./docs/file-demo-" + method + "-checkpoint/checkpoint.dat");
         store = new RecordStore<>(log, new LogRecordCodec(), consumeQueue, checkpoint);
     }
 

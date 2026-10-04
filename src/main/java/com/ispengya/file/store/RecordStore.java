@@ -7,9 +7,6 @@ import com.ispengya.file.core.SequentialLog;
 import com.ispengya.file.index.SimpleConsumeQueue;
 import com.ispengya.file.index.SimpleIndexEntry;
 
-import java.io.File;
-import java.io.IOException;
-import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -157,7 +154,8 @@ public class RecordStore<T> implements AutoCloseable {
             cqOffset = consumeQueue.flush();
         }
         if (checkpoint != null) {
-            checkpoint.save(offset, cqOffset);
+            // 内联 legacy 模式没有 reput 概念:游标位写 -1 哨兵
+            checkpoint.save(offset, cqOffset, -1L, -1L);
         }
         return offset;
     }
@@ -168,53 +166,6 @@ public class RecordStore<T> implements AutoCloseable {
         log.close();
         if (consumeQueue != null) {
             consumeQueue.close();
-        }
-    }
-
-    public static class StoreCheckpoint {
-        private final String filePath;
-
-        public StoreCheckpoint(String filePath) {
-            this.filePath = filePath;
-        }
-
-        public void save(long commitLogMaxOffset, long consumeQueueMaxOffset) {
-            File file = new File(filePath);
-            File parent = file.getParentFile();
-            if (parent != null && !parent.exists()) {
-                parent.mkdirs();
-            }
-            ByteBuffer buffer = ByteBuffer.allocate(16);
-            buffer.putLong(commitLogMaxOffset);
-            buffer.putLong(consumeQueueMaxOffset);
-            buffer.flip();
-            try (RandomAccessFile raf = new RandomAccessFile(file, "rw")) {
-                raf.setLength(16);
-                raf.getChannel().write(buffer);
-                raf.getChannel().force(true);
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
-        }
-
-        public long[] load() {
-            File file = new File(filePath);
-            if (!file.exists() || file.length() < 16) {
-                return null;
-            }
-            ByteBuffer buffer = ByteBuffer.allocate(16);
-            try (RandomAccessFile raf = new RandomAccessFile(file, "r")) {
-                int read = raf.getChannel().read(buffer);
-                if (read < 16) {
-                    return null;
-                }
-                buffer.flip();
-                long commitLogMaxOffset = buffer.getLong();
-                long consumeQueueMaxOffset = buffer.getLong();
-                return new long[]{commitLogMaxOffset, consumeQueueMaxOffset};
-            } catch (IOException e) {
-                throw new RuntimeException(e);
-            }
         }
     }
 }

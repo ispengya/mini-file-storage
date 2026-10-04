@@ -6,7 +6,7 @@ import com.ispengya.file.core.SequentialLogConfig;
 import com.ispengya.file.index.KeyIndexFile;
 import com.ispengya.file.index.SimpleConsumeQueue;
 import com.ispengya.file.store.RecordStore;
-import com.ispengya.file.store.RecordStore.StoreCheckpoint;
+import com.ispengya.file.store.StoreCheckpoint;
 
 import java.io.File;
 import java.io.IOException;
