@@ -41,10 +41,19 @@ public class RecordStore<T> implements AutoCloseable {
         this(log, codec, consumeQueue, null);
     }
 
+    /**
+     * @deprecated 内联索引写路径仅为 FileDemoTest 等手装场景保留;新代码请用纯日志构造
+     *             (cq/checkpoint 传 null)并配 ReputService 构建索引
+     */
+    @Deprecated
     public RecordStore(SequentialLog log, Codec<T> codec, SimpleConsumeQueue consumeQueue, StoreCheckpoint checkpoint) {
         this(log, codec, consumeQueue, checkpoint, DEFAULT_MAX_BODY_SIZE);
     }
 
+    /**
+     * @deprecated 同上:内联 cq/checkpoint 为 legacy 双写路径
+     */
+    @Deprecated
     public RecordStore(SequentialLog log, Codec<T> codec, SimpleConsumeQueue consumeQueue,
                        StoreCheckpoint checkpoint, int maxBodySize) {
         if (maxBodySize <= 0) {

@@ -15,7 +15,15 @@ import java.util.List;
  *   <li>简单 KV/文档:业务键通过 key 参数落 KeyIndex</li>
  * </ul>
  *
- * <p>线程模型:实现类的方法允许并发调用,单条记录的"写入"是串行的。</p>
+ * <h3>一致性语义(取决于 {@code StoreConfig.IndexMode})</h3>
+ * <table border="1">
+ *   <tr><th>方法</th><th>SYNC(默认)</th><th>ASYNC</th></tr>
+ *   <tr><td>{@code get(offset)}</td><td>强一致</td><td>强一致(只读真相源)</td></tr>
+ *   <tr><td>{@code getByLogicalIndex/getByKey/queryByTagRange}</td>
+ *       <td>强一致(put 内等待索引追平)</td><td>最终一致,需先 {@link #awaitIndexed}</td></tr>
+ * </table>
+ *
+ * <p>线程模型:实现类的方法允许并发调用,单条记录的写入是串行的。</p>
  *
  * @param <T> 业务记录类型
  */
@@ -72,7 +80,24 @@ public interface FileStore<T> extends AutoCloseable {
     List<T> queryByTagRange(long beginTag, long endTag);
 
     /**
-     * 将 CommitLog、ConsumeQueue、KeyIndex 全部强制刷盘,并保存 checkpoint。
+     * 等待索引(ConsumeQueue 与 KeyIndex)完整覆盖"起始位置为 offset 的记录"。
+     *
+     * <p>ASYNC 模式下索引读({@code getByLogicalIndex/getByKey/queryByTagRange})的最终一致
+     * 由本方法显式升级为强一致;SYNC 模式下恒立即返回 true。
+     * {@code get(offset)} 只读真相源,任何模式都无需等待。</p>
+     *
+     * @param offset  put 返回的记录起始物理 offset
+     * @return true 已覆盖;false 超时或回放因帧损坏停止(见实现类的错误可见性)
+     */
+    boolean awaitIndexed(long offset, long timeoutMillis);
+
+    /**
+     * 索引已覆盖到的 CommitLog 字节位点(单调不减)
+     */
+    long maxIndexedOffset();
+
+    /**
+     * 将 CommitLog、ConsumeQueue、KeyIndex 全部强制刷盘,并按"数据 → 索引 → 水位"顺序保存 checkpoint。
      */
     void flush();
 

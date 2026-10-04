@@ -9,6 +9,20 @@ package com.ispengya.file.api;
  */
 public class StoreConfig {
 
+    /**
+     * 索引一致性模式
+     */
+    public enum IndexMode {
+        /**
+         * put 内部等待 Reput 把本条记录的索引建完才返回(默认):对外强一致,写放大最小化仍享受单路径
+         */
+        SYNC,
+        /**
+         * put 写完 CommitLog 立即返回:索引读最终一致,需 awaitIndexed 显式升级
+         */
+        ASYNC
+    }
+
     public static final int DEFAULT_COMMIT_LOG_FILE_SIZE = 8 * 1024 * 1024;
     public static final int DEFAULT_CONSUME_QUEUE_FILE_SIZE = 200 * 1024;
     public static final int DEFAULT_KEY_INDEX_FILE_SIZE = 64 * 1024;
@@ -38,6 +52,10 @@ public class StoreConfig {
      * 单条记录 body 上限,防止脏 bodyLen 造成巨帧
      */
     private final int maxBodySize;
+    /**
+     * 索引一致性模式
+     */
+    private final IndexMode indexMode;
 
     private StoreConfig(Builder builder) {
         this.baseDir = builder.baseDir;
@@ -46,6 +64,7 @@ public class StoreConfig {
         this.keyIndexFileSize = builder.keyIndexFileSize;
         this.syncFlush = builder.syncFlush;
         this.maxBodySize = builder.maxBodySize;
+        this.indexMode = builder.indexMode;
     }
 
     public static Builder builder(String baseDir) {
@@ -77,6 +96,13 @@ public class StoreConfig {
      */
     public int getMaxBodySize() {
         return maxBodySize;
+    }
+
+    /**
+     * 索引一致性模式
+     */
+    public IndexMode getIndexMode() {
+        return indexMode;
     }
 
     /**
@@ -123,6 +149,7 @@ public class StoreConfig {
         private int keyIndexFileSize = DEFAULT_KEY_INDEX_FILE_SIZE;
         private boolean syncFlush = false;
         private int maxBodySize = DEFAULT_MAX_BODY_SIZE;
+        private IndexMode indexMode = IndexMode.SYNC;
 
         private Builder(String baseDir) {
             if (baseDir == null || baseDir.trim().isEmpty()) {
@@ -157,6 +184,14 @@ public class StoreConfig {
         public Builder maxBodySize(int maxBodySize) {
             checkPositive(maxBodySize, "maxBodySize");
             this.maxBodySize = maxBodySize;
+            return this;
+        }
+
+        public Builder indexMode(IndexMode indexMode) {
+            if (indexMode == null) {
+                throw new IllegalArgumentException("indexMode must not be null");
+            }
+            this.indexMode = indexMode;
             return this;
         }
 
