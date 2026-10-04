@@ -12,6 +12,9 @@ mini-file-storage 是一个 **零第三方依赖(仅 JDK)** 的迷你顺序存�
 | 业务 key 索引写入与查询(KeyIndex,hash 候选) | `put(value, key)` / `getByKey(key)` |
 | tagCode 范围查询(默认 tag = 写入时刻,可当时间查询) | `queryByTagRange(begin, end)` |
 | 同步/异步刷盘 + checkpoint 落盘 | `flush()` / `StoreConfig.syncFlush` |
+| 帧自校验 | magic + CRC32 覆盖帧头与内容,恢复扫描遇撕裂帧/静默损坏必停,读取抛 `StoreCorruptedException` |
+| 脏尾清除 | 恢复扫描停止后,停点后 4KB 窗口内的残留字节置零落盘 |
+| 进程独占锁 | 同一 `baseDir` 双开直接被 `.store.lock` 拒绝(`StoreLockHeldException`) |
 | 重启恢复(CommitLog / ConsumeQueue / KeyIndex 均扫描恢复追加位置) | 相同 `StoreConfig` 重新打开 |
 
 ### 快速开始(门面 API)
@@ -53,6 +56,7 @@ store.close();
   - [SimpleMappedFileQueue]
   - [SimpleMappedFile]
   - [RecordStore]
+  - RecordFrame（帧编解码，格式知识的唯一来源）
 - 目录与文件名：
 
 | 维度       | 说明                                                                 |
@@ -62,26 +66,36 @@ store.close();
 | 文件命名   | `SimpleMappedFileQueue.formatFileName` 使用 `%020d` 格式化起始偏移，如 `00000000000000000000` |
 | 起始偏移   | 文件名对应的 long 值，即该文件覆盖的 CommitLog 起始物理 offset          |
 
-- 记录格式（RecordStore 视角）：
+- 记录格式（RecordStore 视角，**格式 v2**）：
 
-| 顺序 | 字段            | 长度（字节） | 类型   | 说明                         |
-|------|-----------------|--------------|--------|------------------------------|
-| 1    | bodyLength      | 4            | int    | 后续 payload 的长度          |
-| 2    | payload         | bodyLength   | bytes  | 编码后的业务对象（LogRecord） |
+磁盘单元不再是裸 `[length][payload]`，而是**自校验帧**（`core/RecordFrame`，全部大端）：
 
-`RecordStore.append` 会构造上述 `[length][payload]`，整体视为一条“记录”写入日志。
+| 偏移 | 长度 | 字段             | 说明                                          |
+|------|------|------------------|-----------------------------------------------|
+| 0    | 4    | magic            | `0x484F544B`（"HOTK"），兼作格式版本标识       |
+| 4    | 4    | bodyLen          | Codec 编码后的 payload 字节数                  |
+| 8    | 8    | storeTimestamp   | 引擎盖章的写入时间（服务端接收语义）            |
+| 16   | 8    | tagCode          | 业务 tag，与写入 ConsumeQueue 的值同源          |
+| 24   | 8    | keyHash          | 业务 key 的 32 位 hash（0 = 无 key）            |
+| 32   | 4    | bodyCRC          | CRC32，覆盖 `magic..keyHash` 与 body，不含自身 |
+| 36   | var  | body             | 编码后的业务对象（示例为 LogRecord）            |
+
+帧总长 = 36 + bodyLen。`put(v, key)` 时 keyHash 随帧头落入 CommitLog——索引所需信息全部在日志里，ConsumeQueue / KeyIndex 因此原则上可由日志重建（唯一真相源）。
+
+> ⚠️ v2 与旧版 `[4B length][payload]` 二进制不兼容：旧数据开头读不到 magic，会被视为空洞从头覆盖。升级前清空旧数据目录。
 
 - 单个文件恢复协议（`SimpleMappedFile.recoverRecordStoreWrotePosition`）：
 
-| 步骤 | 条件                                      | 行为                                            |
-|------|-------------------------------------------|-------------------------------------------------|
-| 1    | 从文件头开始，读取 4 字节 length          | 如果读不到完整的 4 字节，则停止                 |
-| 2    | 若 `length <= 0`                          | 判定为无效，停止扫描                            |
-| 3    | 若 `当前位置 + 4 + length > fileSize`     | 判定 payload 越界，停止扫描                     |
-| 4    | 否则                                      | 将 position 前移 `4 + length`，继续下一条记录   |
-| 5    | 扫描结束                                  | 将最后一个合法位置设置为 `wrotePosition` 与 `flushedPosition` |
+| 步骤 | 条件                                                | 行为                                              |
+|------|-----------------------------------------------------|---------------------------------------------------|
+| 1    | 从停点起剩余不足 36B，或 magic 不符                  | 判为帧边界终止，停止扫描（NOT_MATCHED）             |
+| 2    | `bodyLen` 为负或超出文件剩余                         | 脏长度值，停止扫描（NOT_MATCHED）                   |
+| 3    | 重算 CRC 与帧内 bodyCRC 不一致                       | **内容撕裂/静默损坏，停止扫描（CORRUPTED）**        |
+| 4    | 全部通过                                             | position 前移 `36 + bodyLen`，继续下一帧            |
+| 5    | 扫描结束                                             | 停点即 `wrotePosition` / `flushedPosition`          |
+| 6    | 停点后 4KB 窗口内存在非零字节                        | **脏尾置零并立即 force**，不留残余                  |
 
-这样能够在宕机后，从每个 CommitLog 文件中找回“最后一条完整记录结束的位置”。
+**为什么必须有帧头 CRC**：mmap 写回以 4KB 页为单位、页间无顺序保证，`force()`（≈ msync）同样不保证文件内页序——一条跨页记录在断电后可能"头部页已落、体部页丢失"。v1 只校验 length，面对这种"结构合法的坏数据"会静默越过；v2 用 magic+CRC 把判定从"结构像不像"升级为"内容对不对"，恢复必停在损坏帧之前。同一校验在 `read()` 路径复用，盘上静默损坏（bit rot）也会被立即发现并抛 `StoreCorruptedException`。
 
 ---
 
@@ -132,7 +146,7 @@ store.close();
 | 顺序 | 字段           | 长度（字节） | 类型  | 说明                                          |
 |------|----------------|--------------|-------|-----------------------------------------------|
 | 1    | physicalOffset | 8            | long  | 对应 CommitLog 中记录的起始物理 offset        |
-| 2    | size           | 4            | int   | 该记录在 CommitLog 中占用的总字节数（含 length 头） |
+| 2    | size           | 4            | int   | 该记录在 CommitLog 中占用的帧总长（36B 帧头 + body） |
 | 3    | tagCode        | 8            | long  | mini 实现中直接存放 timestamp，用于时间查询   |
 
 - 逻辑 offset → 索引映射：
@@ -255,11 +269,11 @@ store.close();
 1. 业务构造 `LogRecord(ts, level, msg)`；
 2. 调用 `store.append(record, tagCode)`，其中 mini 中通常让 `tagCode = timestamp`；
 3. `RecordStore.append`：
-   - `LogRecordCodec.encode` 生成 payload；
-   - 构造 `[length][payload]`；
-   - 调用 `log.append(recordBytes)` 写入 CommitLog；
-   - 拿到写入完成后的 `maxOffset`，计算该记录的 `recordOffset = maxOffset - recordBytes.length`；
-   - 调用 `consumeQueue.append(recordOffset, recordBytes.length, tagCode)` 生成逻辑索引；
+   - `LogRecordCodec.encode` 生成 body；
+   - `RecordFrame.encode` 组帧（36B 帧头盖 storeTimestamp/tagCode/keyHash + CRC + body）；
+   - 调用 `log.append(frameBytes)` 写入 CommitLog；
+   - 拿到写入完成后的 `maxOffset`，计算该帧的 `recordOffset = maxOffset - frameBytes.length`；
+   - 调用 `consumeQueue.append(recordOffset, frameBytes.length, tagCode)` 生成逻辑索引（size=帧总长，与恢复推进量同源）；
 4. 调用 `store.flush()`：
    - `log.flush()`：
      - `SimpleMappedFileQueue.flush()` 遍历所有文件并 `force()`；
@@ -273,9 +287,9 @@ store.close();
 
 1. 业务持有物理 offset（`recordOffset`）；
 2. 调用 `store.read(recordOffset)`：
-   - 从 CommitLog 读取 4 字节 length；
-   - 再读取 payload；
-   - 通过 `LogRecordCodec.decode` 还原 `LogRecord`。
+   - 从 CommitLog 读取 36 字节帧头，取 bodyLen；
+   - 读取整帧，`RecordFrame.parse` 校验 magic + CRC；
+   - 通过则 `LogRecordCodec.decode` 还原 body，损坏则抛 `StoreCorruptedException`；
 
 - 按逻辑 offset 查询（`testReadByLogicalOffset`）：
 
@@ -311,7 +325,7 @@ store.close();
   - 关闭顺序日志和 ConsumeQueue。
 
 - 重启：
-  - `MmapSequentialLog` 重建文件队列并按 `[length][payload]` 扫描校正 wrotePosition；
+  - `MmapSequentialLog` 重建文件队列并按帧协议(magic+bodyLen+CRC)扫描校正 wrotePosition，停点后的脏尾窗口置零清除；
   - `SimpleConsumeQueue(..., true)` 重建索引文件队列并按 `[offset][size][tagCode]` 扫描校正 wrotePosition；
   - 新写入会从这些有效区域的尾部继续 append，不覆盖旧数据。
 
@@ -321,7 +335,7 @@ store.close();
 
 | 文件类型        | 单条记录/entry 协议                                                |
 |-----------------|---------------------------------------------------------------------|
-| CommitLog       | `[4 字节 length][payload (LogRecord 编码)]`                        |
+| CommitLog       | `[36B 帧头(magic/bodyLen/storeTs/tagCode/keyHash/CRC)][body]`        |
 | LogRecord payload | `[8 ts][4 levelLen][levelBytes][4 msgLen][msgBytes]`            |
 | ConsumeQueue    | `[8 physicalOffset][4 size][8 tagCode]`                            |
 | KeyIndexFile    | `[8 keyHash][8 physicalOffset]`                                     |
@@ -337,7 +351,7 @@ store.close();
 
 | 维度           | mini 实现                                           | RocketMQ 真实实现（目标方向）                              | 可改进点                                       |
 |----------------|-----------------------------------------------------|------------------------------------------------------------|------------------------------------------------|
-| CommitLog 条目 | `[length][payload]`，只校验 length 合法性            | 头部包含 magic、crc、flag、时间戳等，严格校验长度和 CRC     | 为记录增加魔数和 CRC，增强误判保护              |
+| CommitLog 条目 | v2 帧头含 magic+storeTs+tagCode+keyHash，CRC 覆盖头体，结构+内容双校验 | 头部包含 magic、crc、flag、时间戳等，严格校验长度和 CRC     | ✅ 已对齐核心思路（flag/主题等字段仍缺，按需再加）              |
 | 业务 payload   | LogRecordCodec 自定义结构                           | MessageExtStorage 结构更复杂，含 topic、queueId、flag 等   | 在 mini 中增加 topic、queueId 等，模拟多队列场景 |
 | 索引 entry 校验 | ConsumeQueue 只校验 `offset >= 0 && size > 0`       | 还会校验 `offset + size <= commitLogMaxOffset`            | 在恢复时增加与 CommitLog 的交叉校验             |
 
@@ -345,7 +359,7 @@ store.close();
 
 | 能力         | mini 实现                                                   | RocketMQ 真实实现                                        | 可改进点                                                         |
 |--------------|-------------------------------------------------------------|----------------------------------------------------------|------------------------------------------------------------------|
-| CommitLog 恢复 | 逐文件扫描 `[length][payload]`，遇到非法长度停止            | 从 checkpoint 起步，按完整消息结构解析，严格截断尾部    | 利用 checkpoint 的 commitLog 偏移缩小扫描范围                    |
+| CommitLog 恢复 | 逐文件按帧协议扫描，magic/bodyLen/CRC 任一不过即停，脏尾置零清除            | 从 checkpoint 起步，按完整消息结构解析，严格截断尾部    | 利用 checkpoint 的 commitLog 偏移缩小扫描范围                    |
 | ConsumeQueue 恢复 | 只根据自身结构校验 `[offset][size][tagCode]`             | 额外校验 offset 是否落在 CommitLog 合法范围内          | 增加 `offset + size <= commitLogMaxOffset` 的校验                |
 | 索引重建     | 无自动重建逻辑，业务可以手工重跑写入代码                  | 通过 Reput 服务从 CommitLog 回放，自动重建 ConsumeQueue 与 IndexFile | 在 mini 中增加一个简单的“重放线程/方法”，按 CommitLog 顺序重放   |
 | IndexFile 恢复 | 按 16 字节单元顺序扫描恢复追加位置(全零空洞即停);尚无头部元数据与校验 | 读取头部元数据，检查槽位/entry 是否合理，必要时截断或删除 | 为 KeyIndexFile 增加头部和简单的损坏检测策略                    |
@@ -384,7 +398,7 @@ store.close();
    - key 查询；
    - 重启恢复场景。
 4. 按前面“待改进点”的表格，挑一两项动手增强 mini，例如：
-   - 为记录增加 CRC 和魔数；
+   - ~~为记录增加 CRC 和魔数~~（已实现：帧格式 v2，见"一、1. CommitLog"）；
    - 为 ConsumeQueue 增加与 CommitLog 的一致性校验；
    - 为 KeyIndexFile 增加简单的 hash 槽结构；
    - 加一个真正的“从 checkpoint 起点往后重放”的重建方法。
@@ -434,7 +448,7 @@ store.close();
 |---------------------------|------------------------------------------------------------|------------------------------------------------------------------------------------|
 | 物理存储                  | CommitLog 多文件队列（MappedFileQueue）                   | `MmapSequentialLog` + `SimpleMappedFileQueue`                                      |
 | 单文件管理                | 固定大小，文件名为起始 offset，滚动创建                   | 同样：固定大小文件，文件名为起始 offset，滚动创建                                  |
-| 消息物理格式              | 头 + 体，包含多种字段（魔数、CRC、主题、队列 ID 等）      | 简化为 `[4 字节 length][payload]`                                                  |
+| 消息物理格式              | 头 + 体，包含多种字段（魔数、CRC、主题、队列 ID 等）      | v2 帧头：magic + storeTs + tagCode + keyHash + CRC + body                          |
 | 多 Topic/Queue 支持       | 所有消息写同一 CommitLog；按 Topic.Queue 维护 ConsumeQueue | 只做“单队列”模型，但 ConsumeQueue 结构与 RocketMQ 类似                            |
 | 逻辑队列索引结构          | ConsumeQueue：20 字节 `[offset][size][tagCode]`           | `SimpleConsumeQueue`：20 字节结构完全对齐                                          |
 | 按 Topic.Queue + offset 读 | 逻辑 offset → ConsumeQueue → CommitLog                    | `readByLogicalOffset` → `SimpleConsumeQueue` → `RecordStore.read`                  |
@@ -502,7 +516,7 @@ mvn test
 - 第一步：先阅读“RocketMQ 底层存储整体设计概览”，掌握 CommitLog / ConsumeQueue / IndexFile / Checkpoint / Reput 的整体关系；
 - 第二步：再看“mini-file-storage mini 存储引擎设计”，对照 RocketMQ 概念理解 `MmapSequentialLog`、`RecordStore`、`SimpleConsumeQueue`、`KeyIndexFile` 各自的职责；
 - 第三步：结合下面的“写入 / 读取 / 启动恢复 / 重放”流程图，建立模块之间的调用图像；
-- 第四步：最后对照 `FileDemoTest` 和 `FileDemoMain`，从测试/运行示例验证自己对流程的理解。
+- 第四步：最后对照 `FileDemoTest` / `MiniFileStoreTest` / `CommitLogCorruptionTest`，从测试验证自己对流程与损坏语义的理解。
 
 ### 2. 写入流程（从业务对象到磁盘与索引）
 
@@ -512,15 +526,15 @@ mvn test
 业务代码
   └─ RecordStore.append(value, tagCode)
        ├─ Codec.encode(value)                           （对象 → payload）
-       ├─ 构造 [length(4B) + payload] 记录
-       ├─ SequentialLog.append(recordBytes)             （顺序写 CommitLog）
+       ├─ RecordFrame.encode 组帧         （盖 storeTs/tagCode/keyHash + CRC）
+       ├─ SequentialLog.append(frameBytes)   （顺序写 CommitLog）
        │    └─ MmapSequentialLog.append(...)
        │         ├─ SimpleMappedFileQueue.getLastMappedFile(true)
        │         │    └─ SimpleMappedFile.append(...)   （mmap 顺序写单个文件）
        │         └─ fileQueue.getMaxOffset()            （返回当前最大物理 offset）
-       ├─ 计算 recordOffset = maxOffset - recordBytes.length
+       ├─ 计算 recordOffset = maxOffset - frameBytes.length
        ├─ 如果配置了 ConsumeQueue:
-       │    └─ SimpleConsumeQueue.append(recordOffset, length, tagCode)
+       │    └─ SimpleConsumeQueue.append(recordOffset, 帧总长, tagCode)
        │         └─ SimpleMappedFileQueue.getLastMappedFile(true)
        │              └─ SimpleMappedFile.append(20B 索引单元)
        └─ 如果业务配置了 KeyIndex:
@@ -551,9 +565,10 @@ mvn test
 ```text
 业务代码
   └─ RecordStore.read(offset)
-       ├─ log.read(offset, 4)          读取 length
-       ├─ log.read(offset + 4, length) 读取 payload
-       └─ codec.decode(payload)        反序列化为业务对象
+       ├─ log.read(offset, 36)             读帧头，取 bodyLen
+       ├─ log.read(offset, 36 + bodyLen)   读整帧
+       ├─ RecordFrame.parse                magic + CRC 校验（失败抛 StoreCorruptedException）
+       └─ codec.decode(body)               反序列化为业务对象
 ```
 
 按逻辑 offset 读取（通过 ConsumeQueue 索引）：
@@ -611,7 +626,7 @@ mvn test
   │    └─ SimpleMappedFileQueue.recoverForRecordStore(storePath, fileSize)
   │         ├─ 扫描 data 目录下所有 CommitLog 文件
   │         └─ 对每个文件调用 SimpleMappedFile.recoverRecordStoreWrotePosition()
-  │              └─ 按 [length][payload] 顺序扫描，确定 wrotePosition
+  │              └─ 按帧协议(magic+bodyLen+CRC)顺序扫描确定 wrotePosition，停点后 4KB 脏尾置零
   │
   ├─ 构造 SimpleConsumeQueue(cqPath, size, recover = true)
   │    └─ SimpleMappedFileQueue.recoverForConsumeQueue(cqPath, fileSize)
