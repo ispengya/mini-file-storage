@@ -84,6 +84,58 @@ public class SimpleConsumeQueue implements AutoCloseable {
         return mappedFileQueue.flush();
     }
 
+    /**
+     * 当前合法索引条目数(由恢复扫描/追加维护的文件写位置推导,不信任文件尾部残留)
+     */
+    public synchronized long count() {
+        return mappedFileQueue.getMaxOffset() / CQ_STORE_UNIT_SIZE;
+    }
+
+    /**
+     * ConsumeQueue 的"自时钟":CommitLog 中已被索引覆盖到的字节位点。
+     * 由最后一条合法索引的 physicalOffset + size 得出——Reput 重启续传的精确起点。
+     *
+     * @return 已索引位点;空队列为 0
+     */
+    public synchronized long cqCursor() {
+        long n = count();
+        if (n == 0) {
+            return 0L;
+        }
+        SimpleIndexEntry last = get(n - 1);
+        if (last == null) {
+            // 恢复扫描保证 wrotePosition 内全部单元合法,走到这里说明实现被破坏
+            throw new IllegalStateException("consume queue tail entry invalid at count=" + n);
+        }
+        return last.getPhysicalOffset() + last.getSize();
+    }
+
+    /**
+     * 交叉校验式尾部截断:丢弃所有"指向 maxLogOffset 之后数据"的索引条目。
+     * 场景:断电后 CQ 的页落了盘、对应数据帧的页丢了——CQ 时钟超前于数据真相,
+     * 这些条目是撒谎指针,必须从尾部弹出,让 Reput 起点回退到与数据一致的位置。
+     *
+     * @param maxLogOffset CommitLog 恢复后的合法写位置(数据真相)
+     * @return 被截断的条目数
+     */
+    public synchronized long truncateBeyond(long maxLogOffset) {
+        long truncated = 0;
+        while (true) {
+            long n = count();
+            if (n == 0) {
+                break;
+            }
+            SimpleIndexEntry last = get(n - 1);
+            if (last != null && last.getPhysicalOffset() + last.getSize() <= maxLogOffset) {
+                break; // 尾部条目落在数据真相之内,截断完成
+            }
+            // 条目越界(或本身是脏结构):弹掉最后一条索引单元
+            mappedFileQueue.truncateTo((n - 1) * CQ_STORE_UNIT_SIZE);
+            truncated++;
+        }
+        return truncated;
+    }
+
     @Override
     public void close() {
         flush();

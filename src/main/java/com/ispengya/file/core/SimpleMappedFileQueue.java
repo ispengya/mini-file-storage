@@ -183,6 +183,27 @@ public class SimpleMappedFileQueue {
     }
 
     /**
+     * 逻辑截断到指定全局字节位点:起始位点不早于 target 的尾部文件弹出并关闭,
+     * 末文件的 wrote/flushed 下调到 target 之内;之后的追加原位覆盖被截断区域
+     *
+     * @param targetOffset 队列自身字节空间里的合法终点
+     */
+    public synchronized void truncateTo(long targetOffset) {
+        while (!mappedFiles.isEmpty()) {
+            SimpleMappedFile last = mappedFiles.get(mappedFiles.size() - 1);
+            if (last.getFileFromOffset() >= targetOffset) {
+                mappedFiles.remove(mappedFiles.size() - 1);
+                last.close();
+            } else {
+                int wrote = (int) (targetOffset - last.getFileFromOffset());
+                last.setWrotePosition(wrote);
+                last.setFlushedPosition(wrote);
+                break;
+            }
+        }
+    }
+
+    /**
      * 获取当前队列中最大物理偏移量
      */
     public synchronized long getMaxOffset() {
