@@ -45,7 +45,11 @@ public class StoreConfig {
      */
     private final int keyIndexFileSize;
     /**
-     * 是否同步刷盘(每次 append 后立即 flush)
+     * 是否同步刷盘(每次 append 后立即 force 当前数据文件)
+     *
+     * <p>默认 true:put 返回前数据已离开独占页缓存,进程崩溃或断电都不会丢已确认的写入。
+     * 代价是每条记录一次整文件 msync,吞吐敏感场景可显式 {@code syncFlush(false)}
+     * 退化为由调用方 {@link com.ispengya.file.api.FileStore#flush()} 控制刷盘时机。</p>
      */
     private final boolean syncFlush;
     /**
@@ -133,6 +137,13 @@ public class StoreConfig {
         return baseDir + "/checkpoint.properties";
     }
 
+    /**
+     * 磁盘格式/尺寸元数据文件路径(store.properties)
+     */
+    public String metaPath() {
+        return baseDir + "/store.properties";
+    }
+
     @Override
     public String toString() {
         return "StoreConfig{baseDir='" + baseDir + "'"
@@ -147,7 +158,7 @@ public class StoreConfig {
         private int commitLogFileSize = DEFAULT_COMMIT_LOG_FILE_SIZE;
         private int consumeQueueFileSize = DEFAULT_CONSUME_QUEUE_FILE_SIZE;
         private int keyIndexFileSize = DEFAULT_KEY_INDEX_FILE_SIZE;
-        private boolean syncFlush = false;
+        private boolean syncFlush = true;
         private int maxBodySize = DEFAULT_MAX_BODY_SIZE;
         private IndexMode indexMode = IndexMode.SYNC;
 
@@ -176,6 +187,10 @@ public class StoreConfig {
             return this;
         }
 
+        /**
+         * 刷盘策略开关;默认 true(每次 append 后 force 当前文件),关闭后由调用方
+         * 通过 {@link com.ispengya.file.api.FileStore#flush()} 决定刷盘时机
+         */
         public Builder syncFlush(boolean syncFlush) {
             this.syncFlush = syncFlush;
             return this;

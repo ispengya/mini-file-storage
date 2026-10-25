@@ -14,6 +14,7 @@ import java.util.Comparator;
 import java.util.List;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
@@ -160,6 +161,13 @@ public class MiniFileStoreTest {
         } finally {
             reopened.close();
         }
+    }
+
+    @Test
+    public void syncFlushIsEnabledByDefaultAndCanBeDisabled() {
+        String base = dirFor("default-sync").getPath();
+        assertTrue(StoreConfig.builder(base).build().isSyncFlush());
+        assertFalse(StoreConfig.builder(base).syncFlush(false).build().isSyncFlush());
     }
 
     @Test
