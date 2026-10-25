@@ -9,6 +9,7 @@ import com.ispengya.file.index.SimpleConsumeQueue;
 import com.ispengya.file.store.RecordStore;
 import com.ispengya.file.store.ReputService;
 import com.ispengya.file.store.StoreCheckpoint;
+import com.ispengya.file.store.StoreMetadata;
 
 import java.io.File;
 import java.io.IOException;
@@ -36,8 +37,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * <p>启动生命周期:</p>
  * <ol>
  *   <li>抢占 baseDir/.store.lock(进程独占,双开直接拒绝);</li>
- *   <li>CommitLog 按帧协议扫描恢复,CQ/KeyIndex 扫描恢复追加位置;</li>
- *   <li>交叉校验:CQ 中"指向未落盘数据"的撒谎条目从尾部截断;</li>
+ *   <li>校验 store.properties 与当前配置一致,不一致直接拒绝(防止 setLength 静默截断);</li>
+ *   <li>CommitLog 按<b>全局前缀协议</b>恢复:文件必须从 0 连续、封存文件残尾必须全零,
+ *       损坏/缺号即整体截断,后续文件登记 {@code data/.quarantined};</li>
+ *   <li>CQ/KeyIndex 扫描恢复追加位置,交叉校验 CQ 尾部的撒谎条目并从尾部截断;</li>
  *   <li>游标初始化(CQ 自时钟 + checkpoint 的 key 提示,取保守值);</li>
  *   <li>同步 catch-up 回放——冷启动补索引、崩溃自愈、删目录重建是同一段代码;</li>
  *   <li>启动后台 Reput 线程。</li>
@@ -100,12 +103,16 @@ public class MiniFileStore<T> implements FileStore<T> {
         }
 
         try {
+            // 磁盘格式/尺寸强校验:配置与现有布局不一致时直接拒绝,绝不让 setLength 静默改写数据
+            StoreMetadata.verifyOrCreate(config);
+
             mkdirs(config.commitLogPath());
             mkdirs(config.consumeQueuePath());
             mkdirs(config.keyIndexPath());
 
-            this.log = new MmapSequentialLog(
-                    new SequentialLogConfig(config.commitLogPath(), config.getCommitLogFileSize(), config.isSyncFlush()));
+            this.log = new MmapSequentialLog(new SequentialLogConfig(
+                    config.commitLogPath(), config.getCommitLogFileSize(),
+                    config.isSyncFlush(), config.getMaxBodySize()));
 
             try {
                 this.consumeQueue = new SimpleConsumeQueue(
@@ -296,6 +303,17 @@ public class MiniFileStore<T> implements FileStore<T> {
      */
     public StoreConfig getConfig() {
         return config;
+    }
+
+    /**
+     * 本次打开时 CommitLog 全局前缀截断的终点物理位点。
+     * 非 -1 表示启动时发现损坏/缺号,断点之后的数据文件已登记进 {@code data/.quarantined},
+     * 不再参与恢复。
+     *
+     * @return 截断终点;-1 表示日志完整连续
+     */
+    public long getRecoveryTruncatedOffset() {
+        return log.getRecoveryTruncatedOffset();
     }
 
     /**

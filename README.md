@@ -11,13 +11,15 @@ mini-file-storage 是一个 **零第三方依赖(仅 JDK)** 的迷你顺序存�
 | 逻辑位点读取(ConsumeQueue 20 字节定长索引,O(1)) | `getByLogicalIndex(n)` |
 | 业务 key 索引写入与查询(KeyIndex,hash 候选) | `put(value, key)` / `getByKey(key)` |
 | tagCode 范围查询(默认 tag = 写入时刻,可当时间查询) | `queryByTagRange(begin, end)` |
-| 同步/异步刷盘 + checkpoint 落盘 | `flush()` / `StoreConfig.syncFlush` |
+| 同步刷盘(默认开启)+ checkpoint 落盘 | `flush()` / `StoreConfig.syncFlush`(默认 `true`) |
 | 帧自校验 | magic + CRC32 覆盖帧头与内容,恢复扫描遇撕裂帧/静默损坏必停,读取抛 `StoreCorruptedException` |
 | 脏尾清除 | 恢复扫描停止后,停点后 4KB 窗口内的残留字节置零落盘 |
 | 进程独占锁 | 同一 `baseDir` 双开直接被 `.store.lock` 拒绝(`StoreLockHeldException`) |
 | Reput 异步索引 | put 只写 CommitLog,ConsumeQueue/KeyIndex 由后台线程按帧头回放构建 |
 | 一致性分级 | `IndexMode.SYNC`(默认,put 等索引追平)/ `ASYNC`(最终一致 + `awaitIndexed` 显式升级) |
 | 重启恢复(CommitLog / ConsumeQueue / KeyIndex 均扫描恢复追加位置) | 相同 `StoreConfig` 重新打开 |
+| CommitLog 全局前缀校验 | 首文件从 0、文件连续、非末文件残尾必须全零;损坏/缺号即全局截断并登记 `.quarantined`,`getRecoveryTruncatedOffset()` 可观测 |
+| 磁盘格式元数据 | 首次建库写 `store.properties`;文件尺寸/maxBodySize 与磁盘不一致直接拒绝打开,避免 `setLength` 静默截断 |
 | 索引可重建不变式 | 删除索引目录与 checkpoint 后重开,全部查询结果自动恢复(由启动 catch-up 回放) |
 
 ### 快速开始(门面 API)
@@ -38,7 +40,11 @@ store.flush();
 store.close();
 ```
 
-对象与字节的互转通过 `Codec<T>` 注入(内置 `LogRecordCodec` 示例)。默认 `SYNC` 模式下 put 返回即索引可见;吞吐优先可用 `indexMode(ASYNC)` + `awaitIndexed` 显式控制一致性(见下文"整体流程图 → 一致性速查")。完整行为参考单元测试 `MiniFileStoreTest` / `ReputConsistencyTest`。
+对象与字节的互转通过 `Codec<T>` 注入(内置 `LogRecordCodec` 示例)。默认 `SYNC` 模式下 put 返回即索引可见;吞吐优先可用 `indexMode(ASYNC)` + `awaitIndexed` 显式控制一致性(见下文"整体流程图 → 一致性速查")。
+
+持久化默认开启:每次 `put` 在返回前已对数据文件 `force()`(整文件 msync),进程崩溃或掉电不会丢已确认的写入;吞吐优先可 `syncFlush(false)`,改由调用方 `flush()` / `close()` 控制刷盘时机。
+
+首次打开会在 `baseDir` 写 `store.properties`,记录格式版本与所有影响磁盘布局的尺寸;之后用不同的 `commitLogFileSize` / `maxBodySize` 等配置打开会被直接拒绝,避免 `setLength` 静默截断数据。完整行为参考单元测试 `MiniFileStoreTest` / `CommitLogPrefixRecoveryTest` / `CommitLogRolloverTest` / `StoreMetadataTest`。
 
 以下章节展开磁盘格式与内部机制,用于理解门面背后的实现。本工程最初是一组演示:
 
@@ -93,7 +99,8 @@ sequenceDiagram
 flowchart TD
     A["new MiniFileStore(config)"] --> B{"抢 baseDir/.store.lock"}
     B -- 失败 --> X["StoreLockHeldException<br/>(单写者前提,直接拒绝)"]
-    B -- 成功 --> C["三类文件扫描恢复写位置<br/>帧协议(magic+CRC) / 20B 单元 / 16B 单元"]
+    B -- 成功 --> M["StoreMetadata 校验<br/>store.properties ↔ 当前配置"]
+    M --> C["CommitLog 全局前缀恢复<br/>连续 / 残尾 / 缺号 → 截断 + .quarantined<br/>再扫描 CQ(20B) / KeyIndex(16B) 写位置"]
     C --> D["交叉校验:CQ 尾部<br/>off+size > 数据真相 的撒谎条目 → 截断"]
     D --> E["游标初始化<br/>cqCursor = CQ 自时钟(精确)<br/>keyCursor = min(checkpoint 提示, cqCursor)"]
     E --> F["catch-up 同步回放到日志合法尾<br/>冷启动补索引 = 崩溃自愈 = 删目录重建"]
@@ -154,11 +161,27 @@ flowchart TD
 | 步骤 | 条件                                                | 行为                                              |
 |------|-----------------------------------------------------|---------------------------------------------------|
 | 1    | 从停点起剩余不足 36B，或 magic 不符                  | 判为帧边界终止，停止扫描（NOT_MATCHED）             |
-| 2    | `bodyLen` 为负或超出文件剩余                         | 脏长度值，停止扫描（NOT_MATCHED）                   |
+| 2    | `bodyLen` 为负、超过 `maxBodySize` 或超出文件剩余     | 脏长度值，停止扫描（NOT_MATCHED）                   |
 | 3    | 重算 CRC 与帧内 bodyCRC 不一致                       | **内容撕裂/静默损坏，停止扫描（CORRUPTED）**        |
 | 4    | 全部通过                                             | position 前移 `36 + bodyLen`，继续下一帧            |
 | 5    | 扫描结束                                             | 停点即 `wrotePosition` / `flushedPosition`          |
-| 6    | 停点后 4KB 窗口内存在非零字节                        | **脏尾置零并立即 force**，不留残余                  |
+| 6    | 末文件停点后存在非零字节                             | **整段脏尾置零并立即 force**，从断点继续追加         |
+
+- 全局前缀恢复协议（`SimpleMappedFileQueue.recoverForRecordStore`）：
+
+| 条件 | 行为 |
+|------|------|
+| 首文件不是从偏移 0 开始 | 拒绝启动（前缀起点已丢失，不能当空库覆盖） |
+| 文件起始偏移不连续（缺号/多出非法文件） | 在期望起点全局截断，之后文件登记隔离 |
+| 非末文件为空，或停点之后存在非零残尾 | 在该文件断点全局截断，之后文件登记隔离 |
+| 末文件存在撕裂残尾 | 允许恢复，整段清零后从断点继续写 |
+| 隔离落盘 | 之后文件起始偏移写入 `data/.quarantined`，并抹掉首帧 magic（清单丢失时的安全网） |
+| 日志增长到隔离文件起点 | 先整文件清零，再从清单移除并复用 |
+| 截断发生 | `MiniFileStore.getRecoveryTruncatedOffset()` 返回断点，`-1` 表示日志完整连续 |
+
+> 隔离采用“清单 + 清零”而不是 rename：Windows 上 mmap 未释放时无法重命名/删除数据文件，两种平台语义一致。
+
+- Reput 跨文件回放：帧不跨文件，封存文件尾部“装不下下一帧”的浪费区不可读；游标落在该区域时通过 `nextFileStartOffset` 跳到下一个文件起点，不会把零字节当坏帧，也不会卡死（`CommitLogRolloverTest` 覆盖）。
 
 **为什么必须有帧头 CRC**：mmap 写回以 4KB 页为单位、页间无顺序保证，`force()`（≈ msync）同样不保证文件内页序——一条跨页记录在断电后可能"头部页已落、体部页丢失"。v1 只校验 length，面对这种"结构合法的坏数据"会静默越过；v2 用 magic+CRC 把判定从"结构像不像"升级为"内容对不对"，恢复必停在损坏帧之前。同一校验在 `read()` 路径复用，盘上静默损坏（bit rot）也会被立即发现并抛 `StoreCorruptedException`。
 
@@ -340,6 +363,8 @@ flowchart TD
 | ConsumeQueue    | `[8 physicalOffset][4 size][8 tagCode]`（size=帧总长）               |
 | KeyIndexFile    | `[8 keyHash][8 physicalOffset]`                                     |
 | StoreCheckpoint | 88B 双槽文件，每槽 `[magic][seq][4×水位][crc]`（v2 原子交替）        |
+| store.properties | 首次建库写入的格式元数据：`format.version / commitLogFileSize / consumeQueueFileSize / keyIndexFileSize / maxBodySize`，启动强校验 |
+| data/.quarantined | 全局前缀截断后不再参与恢复的数据文件起始偏移清单（每行一个），复用该偏移时自动移除 |
 | .store.lock     | 空文件，仅作进程独占锚（内容无意义，永不删除）                       |
 
 ---
@@ -360,9 +385,9 @@ flowchart TD
 
 | 能力         | mini 实现                                                   | RocketMQ 真实实现                                        | 可改进点                                                         |
 |--------------|-------------------------------------------------------------|----------------------------------------------------------|------------------------------------------------------------------|
-| CommitLog 恢复 | 逐文件按帧协议扫描，magic/bodyLen/CRC 任一不过即停，脏尾置零清除            | 从 checkpoint 起步，按完整消息结构解析，严格截断尾部    | 利用 checkpoint 的 commitLog 偏移缩小扫描范围                    |
+| CommitLog 恢复 | 逐帧 CRC 扫描 + 全局前缀校验：首文件从 0、文件连续、非末文件残尾必须全零；损坏/缺号即整体截断，后续文件登记 `.quarantined`；末文件脏尾整段清零 | 从 checkpoint 起步，按完整消息结构解析，严格截断尾部    | 利用 checkpoint 的 commitLog 偏移缩小扫描范围                    |
 | ConsumeQueue 恢复 | 只根据自身结构校验 `[offset][size][tagCode]`             | 额外校验 offset 是否落在 CommitLog 合法范围内          | 增加 `offset + size <= commitLogMaxOffset` 的校验                |
-| 索引重建     | 无自动重建逻辑，业务可以手工重跑写入代码                  | 通过 Reput 服务从 CommitLog 回放，自动重建 ConsumeQueue 与 IndexFile | 在 mini 中增加一个简单的“重放线程/方法”，按 CommitLog 顺序重放   |
+| 索引重建     | Reput 启动 catch-up 按 CommitLog 回放，自动重建 ConsumeQueue/KeyIndex；单独丢失 KeyIndex（CQ 完好）不会触发全量回放 | 通过 Reput 服务从 CommitLog 回放，自动重建 ConsumeQueue 与 IndexFile | 检测 KeyIndex 缺失时显式触发全量 key 回放 |
 | IndexFile 恢复 | 按 16 字节单元顺序扫描恢复追加位置(全零空洞即停);尚无头部元数据与校验 | 读取头部元数据，检查槽位/entry 是否合理，必要时截断或删除 | 为 KeyIndexFile 增加头部和简单的损坏检测策略                    |
 
 ### 3. 索引能力
@@ -377,7 +402,7 @@ flowchart TD
 
 | 维度           | mini 实现                                  | RocketMQ 真实实现                            | 可改进点                                           |
 |----------------|--------------------------------------------|----------------------------------------------|----------------------------------------------------|
-| 刷盘策略       | `SequentialLogConfig.isSyncFlush`，要么同步要么简单异步 | 同步/异步刷盘，单独的 flush/commit 线程      | 将 flush 抽成单独线程，模拟高吞吐异步 flush 情况  |
+| 刷盘策略       | `syncFlush` 默认 true(每条 append 后 force);关闭后由调用方 `flush()` 控制，无后台刷盘线程 | 同步/异步刷盘，单独的 flush/commit 线程      | 将 flush 抽成单独线程，模拟高吞吐异步 flush 情况  |
 | Page Cache 利用 | 使用 mmap，简化版实现                      | 同样大量使用 mmap 和 Page Cache              | 增加写入压力测试，观察 flush 策略对延迟的影响       |
 | 零拷贝发送     | 未实现                                     | 发送时使用 FileRegion/sendfile 等            | 在 mini 的“读取/发送”路径中模拟直接从文件到 socket |
 

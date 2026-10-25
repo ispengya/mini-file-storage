@@ -207,7 +207,14 @@ public class ReputService {
         try {
             header = log.read(cqCursor, RecordFrame.HEADER_SIZE);
         } catch (IllegalArgumentException e) {
-            return; // 越过合法写位置:数据还没到,等下一次
+            // 帧不跨文件:封存文件尾部可能存在"装不下下一帧"的浪费区。
+            // 游标落在该区域时必须跳到下一个文件起点,否则会把零字节当坏帧或永久卡住。
+            long nextFileStart = log.nextFileStartOffset(cqCursor);
+            if (nextFileStart > cqCursor) {
+                cqCursor = nextFileStart;
+                lock.notifyAll();
+            }
+            return; // 没有下一个文件:数据还没到,等下一次
         }
         int bodyLen = ByteBuffer.wrap(header).getInt(4);
         int total = RecordFrame.HEADER_SIZE + bodyLen;

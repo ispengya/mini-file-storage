@@ -20,7 +20,8 @@ public class MmapSequentialLog implements SequentialLog {
     public MmapSequentialLog(SequentialLogConfig config) {
         this.config = config;
         try {
-            this.fileQueue = SimpleMappedFileQueue.recoverForRecordStore(config.getStorePath(), config.getFileSize());
+            this.fileQueue = SimpleMappedFileQueue.recoverForRecordStore(
+                    config.getStorePath(), config.getFileSize(), config.getMaxBodySize());
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
@@ -110,5 +111,22 @@ public class MmapSequentialLog implements SequentialLog {
     public synchronized void close() {
         flush();
         fileQueue.close();
+    }
+
+    /**
+     * 本次打开时全局前缀截断的终点物理位点
+     *
+     * @return 截断终点;-1 表示日志完整连续,未发生截断
+     */
+    public synchronized long getRecoveryTruncatedOffset() {
+        return fileQueue.getRecoveryTruncatedOffset();
+    }
+
+    /**
+     * 物理偏移所在文件的下一个文件起点;无下一个文件时返回 offset 本身
+     */
+    @Override
+    public synchronized long nextFileStartOffset(long offset) {
+        return fileQueue.nextFileStartOffset(offset);
     }
 }

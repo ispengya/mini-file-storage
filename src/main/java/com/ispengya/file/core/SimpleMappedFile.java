@@ -38,6 +38,12 @@ public class SimpleMappedFile {
      */
     private final AtomicInteger flushedPosition = new AtomicInteger(0);
     /**
+     * 是否已被判定为写满:帧装不下时置位。
+     * 不再把 wrotePosition 抬到 fileSize——浪费区必须保持"不可读",
+     * 否则 Reput 会把零字节当成坏帧。
+     */
+    private volatile boolean full;
+    /**
      * 该文件起始物理偏移量
      */
     private final long fileFromOffset;
@@ -70,7 +76,7 @@ public class SimpleMappedFile {
      * 当前文件是否已写满
      */
     public boolean isFull() {
-        return this.wrotePosition.get() >= this.fileSize;
+        return this.full || this.wrotePosition.get() >= this.fileSize;
     }
 
     public long getFileFromOffset() {
@@ -93,18 +99,21 @@ public class SimpleMappedFile {
     public boolean append(byte[] data, int offset, int length) {
         int currentPos = this.wrotePosition.get();
         if (currentPos + length > this.fileSize) {
-            this.wrotePosition.set(this.fileSize);
+            this.full = true;
             return false;
         }
         ByteBuffer buffer = this.mappedByteBuffer.slice();
         buffer.position(currentPos);
         buffer.put(data, offset, length);
-        this.wrotePosition.addAndGet(length);
+        if (this.wrotePosition.addAndGet(length) >= this.fileSize) {
+            this.full = true;
+        }
         return true;
     }
 
     public void setWrotePosition(int position) {
         this.wrotePosition.set(position);
+        this.full = position >= this.fileSize;
     }
 
     public void setFlushedPosition(int position) {
@@ -118,40 +127,75 @@ public class SimpleMappedFile {
      * 或 CORRUPTED(magic 完好但 CRC 不符,即断电页撕裂)均停止推进——
      * 这是与 v1"只看 length 结构"的本质区别:内容损坏不再被静默放行。</p>
      *
-     * <p>停止后对 [停点, 停点+4KB) 做脏尾清除:存在非零字节则整段置零并立即 force,
-     * 避免半条记录残留盘上(Java 无法对 mmap 中的文件安全 truncate,置零等效)。</p>
+     * <p>本方法只负责定位断点,不清洗尾部:尾部是否合法由调用方按文件角色判断
+     * (末文件允许撕裂残尾,非末文件必须全零)。</p>
      *
+     * @param maxBodySize bodyLen 合法上限,必须与读路径使用同一个值
      * @return 恢复出的写入位置(最后一条完整帧的结束位置)
      */
-    public int recoverRecordStoreWrotePosition() {
+    public int recoverRecordStoreWrotePosition(int maxBodySize) {
         int position = 0;
         ByteBuffer buffer = this.mappedByteBuffer.slice();
         while (true) {
             RecordFrame.Frame frame = RecordFrame.parse(
-                    buffer, position, this.fileSize - position, Integer.MAX_VALUE);
+                    buffer, position, this.fileSize - position, maxBodySize);
             if (frame.getStatus() != RecordFrame.Status.OK) {
                 break;
             }
             position += frame.getTotalLen();
         }
-        this.wrotePosition.set(position);
+        setWrotePosition(position);
         this.flushedPosition.set(position);
+        return position;
+    }
 
-        int clearTo = Math.min(position + 4096, this.fileSize);
-        boolean dirtyTail = false;
-        for (int i = position; i < clearTo; i++) {
+    /**
+     * 检查 [position, fileSize) 是否全为零。
+     *
+     * <p>顺序日志正常滚动时,"装不下下一帧"留下的浪费区本来就是预分配的零字节;
+     * 非末文件出现非零尾部,只能是断电残帧或外部损坏,必须按全局前缀截断处理。</p>
+     */
+    public boolean isTailZero(int position) {
+        ByteBuffer buffer = this.mappedByteBuffer.slice();
+        for (int i = Math.max(position, 0); i < this.fileSize; i++) {
             if (buffer.get(i) != 0) {
-                dirtyTail = true;
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 把 [position, fileSize) 整段置零并 force(等价于逻辑 truncate)。
+     *
+     * <p>只清 4KB 不足以覆盖大帧撕裂后的残留;整段清零保证下次恢复不会把残片当数据。</p>
+     */
+    public void zeroTailFrom(int position) {
+        int from = Math.max(position, 0);
+        if (from >= this.fileSize) {
+            return;
+        }
+        ByteBuffer probe = this.mappedByteBuffer.slice();
+        boolean dirty = false;
+        for (int i = from; i < this.fileSize; i++) {
+            if (probe.get(i) != 0) {
+                dirty = true;
                 break;
             }
         }
-        if (dirtyTail) {
-            for (int i = position; i < clearTo; i++) {
-                buffer.put(i, (byte) 0);
-            }
-            this.mappedByteBuffer.force();
+        if (!dirty) {
+            return;
         }
-        return position;
+        byte[] zeros = new byte[8192];
+        int cursor = from;
+        while (cursor < this.fileSize) {
+            int len = Math.min(zeros.length, this.fileSize - cursor);
+            ByteBuffer buffer = this.mappedByteBuffer.slice();
+            buffer.position(cursor);
+            buffer.put(zeros, 0, len);
+            cursor += len;
+        }
+        this.mappedByteBuffer.force();
     }
 
     public int recoverConsumeQueueWrotePosition() {
@@ -166,7 +210,7 @@ public class SimpleMappedFile {
             }
             position += 20;
         }
-        this.wrotePosition.set(position);
+        setWrotePosition(position);
         this.flushedPosition.set(position);
         return position;
     }
@@ -193,7 +237,7 @@ public class SimpleMappedFile {
             }
             position += 16;
         }
-        this.wrotePosition.set(position);
+        setWrotePosition(position);
         this.flushedPosition.set(position);
         return position;
     }

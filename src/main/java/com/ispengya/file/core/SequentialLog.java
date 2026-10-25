@@ -51,5 +51,24 @@ public interface SequentialLog extends AutoCloseable {
      */
     @Override
     void close();
+
+    /**
+     * 本次打开时全局前缀截断的终点物理位点
+     *
+     * @return 截断终点;-1 表示日志完整连续,未发生截断(默认实现)
+     */
+    default long getRecoveryTruncatedOffset() {
+        return -1L;
+    }
+
+    /**
+     * 物理偏移所在文件的下一个文件起点
+     *
+     * <p>帧不跨文件,封存文件尾部可能有浪费区;索引回放据此跨过空洞。
+     * 没有下一个文件时返回 offset 本身(默认实现)。</p>
+     */
+    default long nextFileStartOffset(long offset) {
+        return offset;
+    }
 }
 
