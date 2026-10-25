@@ -3,6 +3,7 @@ package com.ispengya.file.core;
 import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
@@ -10,6 +11,7 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -17,7 +19,10 @@ import java.util.Set;
 
 /**
  * 简化版映射文件队列
- * 管理同一目录下的一组顺序文件，负责文件滚动与统一刷盘
+ * 管理同一目录下的一组顺序文件，负责文件滚动与统一刷盘。
+ *
+ * <p>内置 CommitLog/CQ/KeyIndex 的格式特定恢复之外,{@link #recoverWith}
+ * 允许自定义索引文件复用同一套分段管理与恢复流程。</p>
  */
 public class SimpleMappedFileQueue {
     /**
@@ -47,6 +52,64 @@ public class SimpleMappedFileQueue {
         this.storePath = storePath;
         this.fileSize = fileSize;
         SimpleMappedFile.ensureDirOK(storePath);
+    }
+
+    /**
+     * 自定义分段格式的恢复扫描器
+     */
+    @FunctionalInterface
+    public interface SegmentScanner {
+        /**
+         * 扫描单个分段文件
+         *
+         * @param file     当前数据文件
+         * @param fileSize 预分配文件大小
+         * @param mapped   只读映射视图(position=0, limit=fileSize)
+         * @return 有效写入位置(字节数,必须在 [0, fileSize] 内)
+         */
+        int scan(File file, int fileSize, ByteBuffer mapped);
+    }
+
+    /**
+     * 通用分段恢复:分段文件管理/滚动/刷盘复用 {@link SimpleMappedFileQueue},
+     * 每个文件的有效区由调用方通过 {@link SegmentScanner} 定义。
+     *
+     * <p>适用于自定义 ConsumeQueue / IndexFile 等派生索引文件。它只做逐文件恢复,
+     * 不做 CommitLog 的全局前缀/隔离语义——派生索引损坏时应由索引自己决定
+     * "从 0 全量重建"还是保留前缀。</p>
+     */
+    public static SimpleMappedFileQueue recoverWith(String storePath, int fileSize,
+                                                     SegmentScanner scanner) throws IOException {
+        if (scanner == null) {
+            throw new IllegalArgumentException("scanner must not be null");
+        }
+        SimpleMappedFileQueue queue = new SimpleMappedFileQueue(storePath, fileSize);
+        File[] files = listNumericFiles(storePath, Collections.emptySet());
+        for (File file : files) {
+            long start = Long.parseLong(file.getName());
+            SimpleMappedFile mappedFile = new SimpleMappedFile(file.getPath(), fileSize, start);
+            int wrote;
+            try {
+                wrote = scanner.scan(file, fileSize, mappedFile.mappedView());
+            } catch (RuntimeException e) {
+                mappedFile.close();
+                throw new IOException("scan index segment failed: " + file, e);
+            }
+            if (wrote < 0 || wrote > fileSize) {
+                mappedFile.close();
+                throw new IOException("scanner returned invalid position " + wrote + " for " + file);
+            }
+            mappedFile.setWrotePosition(wrote);
+            mappedFile.setFlushedPosition(wrote);
+            // 清掉有效区之后的残片,防止下次恢复把旧 entry 重新采纳
+            mappedFile.zeroTailFrom(wrote);
+            if (wrote > 0 || queue.mappedFiles.isEmpty()) {
+                queue.mappedFiles.add(mappedFile);
+            } else {
+                mappedFile.close();
+            }
+        }
+        return queue;
     }
 
     /**
@@ -409,8 +472,11 @@ public class SimpleMappedFileQueue {
     }
 
     /**
-     * 逻辑截断到指定全局字节位点:起始位点不早于 target 的尾部文件弹出并关闭,
-     * 末文件的 wrote/flushed 下调到 target 之内;之后的追加原位覆盖被截断区域
+     * 截断到指定全局字节位点:起始位点不早于 target 的尾部文件弹出并关闭,
+     * 末文件的 wrote/flushed 下调到 target 之内。
+     *
+     * <p>被截断的数据必须<b>物理清零</b>:否则重启后的格式扫描会把旧 entry 重新
+     * 采纳,出现"截断后又复活"。弹出文件整段清零,末文件从 target 起清零。</p>
      *
      * @param targetOffset 队列自身字节空间里的合法终点
      */
@@ -419,11 +485,13 @@ public class SimpleMappedFileQueue {
             SimpleMappedFile last = mappedFiles.get(mappedFiles.size() - 1);
             if (last.getFileFromOffset() >= targetOffset) {
                 mappedFiles.remove(mappedFiles.size() - 1);
+                last.zeroTailFrom(0);
                 last.close();
             } else {
                 int wrote = (int) (targetOffset - last.getFileFromOffset());
                 last.setWrotePosition(wrote);
                 last.setFlushedPosition(wrote);
+                last.zeroTailFrom(wrote);
                 break;
             }
         }
@@ -454,6 +522,20 @@ public class SimpleMappedFileQueue {
             return i + 1 < mappedFiles.size() ? mappedFiles.get(i + 1).getFileFromOffset() : offset;
         }
         return offset;
+    }
+
+    /**
+     * 存储目录
+     */
+    public String getStorePath() {
+        return storePath;
+    }
+
+    /**
+     * 单个分段文件大小
+     */
+    public int getFileSize() {
+        return fileSize;
     }
 
     /**

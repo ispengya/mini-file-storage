@@ -64,6 +64,28 @@ public interface FileStore<T> extends AutoCloseable {
     T get(long physicalOffset);
 
     /**
+     * 从物理 offset 0 开始只读扫描当前 CommitLog 的稳定快照。
+     *
+     * <p>扫描范围在创建时固定,不追逐之后的新写入;典型用于启动加载、
+     * 离线 compaction/rewrite、自定义索引重建。</p>
+     */
+    RecordScanner scan();
+
+    /**
+     * 从指定物理 offset 开始只读扫描。
+     *
+     * <p>起始位点应是帧边界(例如 put 返回值或上一次扫描的
+     * {@link RecordScanner#endOffset()}),否则会因帧校验失败抛
+     * {@link StoreCorruptedException}。</p>
+     */
+    RecordScanner scanFrom(long startOffset);
+
+    /**
+     * 按 CommitLog 顺序解码并访问记录;visitor 返回 false 可提前停止。
+     */
+    void forEach(RecordVisitor<T> visitor);
+
+    /**
      * 按逻辑位点(第 N 条记录,从 0 开始)读取,经由 ConsumeQueue 定位。
      *
      * <p>需要 ConsumeQueue 索引已启用;未启用时抛 {@code IllegalStateException}。</p>

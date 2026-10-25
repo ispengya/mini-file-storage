@@ -80,6 +80,7 @@ public class MiniFileStore<T> implements FileStore<T> {
     private static final long INDEX_JOIN_TIMEOUT_MILLIS = 5_000L;
 
     private final StoreConfig config;
+    private final Codec<T> codec;
     private final FileChannel lockChannel;
     private final FileLock storeLock;
     private final SequentialLog log;
@@ -102,7 +103,8 @@ public class MiniFileStore<T> implements FileStore<T> {
 
     private MiniFileStore(Builder<T> builder) {
         this.config = builder.config;
-        Codec<T> codec = builder.codec;
+        this.codec = builder.codec;
+        Codec<T> codec = this.codec;
 
         // 进程级单实例互斥:先抢 .store.lock,失败立即拒绝,绝不带着双写风险继续装配
         String lockPath = config.getBaseDir() + "/.store.lock";
@@ -266,6 +268,37 @@ public class MiniFileStore<T> implements FileStore<T> {
     @Override
     public synchronized T get(long physicalOffset) {
         return recordStore.read(physicalOffset);
+    }
+
+    @Override
+    public RecordScanner scan() {
+        return scanFrom(0L);
+    }
+
+    @Override
+    public RecordScanner scanFrom(long startOffset) {
+        if (closed.get()) {
+            throw new IllegalStateException("store already closed");
+        }
+        return new CommitLogScanner(log, config.getMaxBodySize(), startOffset);
+    }
+
+    @Override
+    public void forEach(RecordVisitor<T> visitor) {
+        if (visitor == null) {
+            throw new IllegalArgumentException("visitor must not be null");
+        }
+        if (closed.get()) {
+            throw new IllegalStateException("store already closed");
+        }
+        try (RecordScanner scanner = scan()) {
+            while (scanner.next()) {
+                T value = codec.decode(scanner.body());
+                if (!visitor.visit(scanner.offset(), scanner.frame(), value)) {
+                    break;
+                }
+            }
+        }
     }
 
     @Override

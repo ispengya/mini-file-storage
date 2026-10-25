@@ -3,12 +3,6 @@ package com.ispengya.file.index;
 import com.ispengya.file.core.RecordFrame;
 
 import java.io.File;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.util.List;
 
 /**
@@ -24,7 +18,7 @@ import java.util.List;
 public class KeyIndexPlugin implements RecordIndex {
 
     private final KeyIndexFile keyIndexFile;
-    private final File cursorFile;
+    private final IndexCursorFile cursorFile;
 
     private volatile long cursor;
 
@@ -33,7 +27,7 @@ public class KeyIndexPlugin implements RecordIndex {
      */
     public KeyIndexPlugin(KeyIndexFile keyIndexFile, File cursorFile) {
         this.keyIndexFile = keyIndexFile;
-        this.cursorFile = cursorFile;
+        this.cursorFile = cursorFile == null ? null : new IndexCursorFile(cursorFile);
     }
 
     @Override
@@ -43,7 +37,7 @@ public class KeyIndexPlugin implements RecordIndex {
 
     @Override
     public long replayFrom(long logMaxOffset) {
-        long stored = readCursor();
+        long stored = cursorFile == null ? -1L : cursorFile.load();
         long from = stored >= 0 && stored <= logMaxOffset && keyIndexFile.count() > 0
                 ? stored : 0L;
         this.cursor = from;
@@ -66,7 +60,9 @@ public class KeyIndexPlugin implements RecordIndex {
     @Override
     public void flush() {
         keyIndexFile.flush();
-        writeCursor(cursor);
+        if (cursorFile != null) {
+            cursorFile.save(cursor);
+        }
     }
 
     @Override
@@ -93,53 +89,4 @@ public class KeyIndexPlugin implements RecordIndex {
         return keyIndexFile.count();
     }
 
-    /**
-     * 读取游标;文件缺失/损坏时返回 -1(调用方退化为全量回放)
-     */
-    private long readCursor() {
-        if (cursorFile == null || !cursorFile.exists()) {
-            return -1L;
-        }
-        try {
-            String text = new String(Files.readAllBytes(cursorFile.toPath()), StandardCharsets.UTF_8).trim();
-            return text.isEmpty() ? -1L : Long.parseLong(text);
-        } catch (IOException | NumberFormatException e) {
-            return -1L;
-        }
-    }
-
-    /**
-     * 原子写入游标:数据先 flush,游标后落盘,崩溃最多退回旧游标重放
-     */
-    private void writeCursor(long value) {
-        if (cursorFile == null) {
-            return;
-        }
-        Path target = cursorFile.toPath();
-        Path tmp = null;
-        try {
-            File parent = cursorFile.getParentFile();
-            if (parent != null) {
-                parent.mkdirs();
-            }
-            tmp = Files.createTempFile(target.getParent(), ".key-cursor", ".tmp");
-            Files.write(tmp, Long.toString(value).getBytes(StandardCharsets.UTF_8));
-            try {
-                Files.move(tmp, target,
-                        StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException e) {
-                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
-            }
-            tmp = null;
-        } catch (IOException e) {
-            throw new IllegalStateException("failed to persist key index cursor: " + cursorFile, e);
-        } finally {
-            if (tmp != null) {
-                try {
-                    Files.deleteIfExists(tmp);
-                } catch (IOException ignored) {
-                }
-            }
-        }
-    }
 }

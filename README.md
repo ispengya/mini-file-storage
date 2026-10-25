@@ -18,6 +18,8 @@ mini-file-storage 是一个 **零第三方依赖(仅 JDK)** 的迷你顺序存�
 | IndexHost 索引宿主 | put 只写 CommitLog;启用的索引插件(CQ/KeyIndex/自定义)由后台线程按帧回放构建 |
 | 可选索引装配 | builder 默认纯 WAL;`withConsumeQueue()` / `withKeyIndex()` / `withDefaultIndexes()` / `withIndex(custom)` |
 | 自定义索引 SPI | 实现 `RecordIndex`(`replayFrom`/`onFrame`/`progress`/`flush`),启动回放与实时追加共用同一驱动 |
+| CommitLog 只读扫描 | `scan()` / `scanFrom()` / `forEach()`;固定快照、跨文件跳过浪费区,供加载/重建/离线重写使用 |
+| 通用索引文件工具 | `FixedUnitIndexFile` + `IndexEntryCodec` + `IndexCursorFile`;自定义 CQ/IndexFile 复用分段、恢复、滚动与物理截断 |
 | 一致性分级 | `IndexMode.SYNC`(默认,put 等所有启用索引追平;无索引立即返回)/ `ASYNC`(最终一致 + `awaitIndexed` 显式升级) |
 | 重启恢复(CommitLog / ConsumeQueue / KeyIndex 均扫描恢复追加位置) | 相同 `StoreConfig` 重新打开 |
 | CommitLog 全局前缀校验 | 首文件从 0、文件连续、非末文件残尾必须全零;损坏/缺号即全局截断并登记 `.quarantined`,`getRecoveryTruncatedOffset()` 可观测 |
@@ -92,6 +94,73 @@ public interface RecordIndex {
 ```
 
 `onFrame` 可能由后台索引线程调用,自定义索引的查询视图需要自行保证并发安全;全局截断后,插件应在 `replayFrom(logMaxOffset)` 中清理越界状态,或让查询视图丢弃 `offset >= logMaxOffset` 的陈旧结果。**不要在 `onFrame` 里回调 `MiniFileStore` 的读写方法**——SYNC put 正持有门面锁等待索引追平,会形成死锁环;需要的数据从传入的 frame/body 取。
+
+### 只读扫描与离线重写
+
+`scan()` / `scanFrom()` 返回固定快照:
+
+```java
+try (RecordScanner scanner = store.scan()) {
+    while (scanner.next()) {
+        long offset = scanner.offset();
+        LogRecord r = codec.decode(scanner.body());
+        // 加载内存 Map / 重建自定义索引 / compaction
+    }
+}
+```
+
+- 扫描范围在创建时固定,不会追逐之后的新写入;需要"快照 + 尾部追赶"时记录 `scanner.endOffset()`,再用 `store.scanFrom(endOffset)` 续扫。
+- `forEach(visitor)` 是解码版,visitor 返回 false 可提前停止。
+
+**离线 rewrite / Redis AOF rewrite 的可行路径**:
+
+1. 停止写入并关闭旧 store(或接受"快照 + 尾部追赶");
+2. `scan()` 遍历旧日志,业务层做 compaction(每个 key 只留最新值、丢弃 tombstone);
+3. 写入一个新的 store / 新 generation 目录,flush/close;
+4. 原子切换目录或指针,重新打开;
+5. 新日志从 0 开始,CQ/KeyIndex/自定义索引按游标从 0 重建;消费位点等权威状态必须独立保存。
+
+> 当前**没有内置在线 rewrite/generation 切换,也没有删头/保留策略**;物理 offset 在重写后会改变,所有存物理 offset 的索引都必须重建。截断操作会物理清零被截断区域,重启不会复活旧 entry。
+
+### 自定义 CQ / IndexFile 的文件工具包
+
+如果自定义索引也是定长 entry,不需要重写文件滚动与恢复:
+
+```java
+IndexEntryCodec<MyEntry> codec = ...;                 // unitSize/decode/encode/isValid
+FixedUnitIndexFile<MyEntry> file =
+        FixedUnitIndexFile.open("./data/my-index", 1024 * 1024, codec);
+file.append(entry);
+MyEntry e = file.get(0);
+file.flush();
+```
+
+组合进 `RecordIndex`:
+
+```java
+class MyIndex implements RecordIndex {
+    private final FixedUnitIndexFile<MyEntry> file = ...;
+    private final IndexCursorFile cursor = new IndexCursorFile(".../cursor");
+
+    public long replayFrom(long max) {
+        long c = cursor.load();
+        return c >= 0 && c <= max && file.count() > 0 ? c : 0;
+    }
+    public void onFrame(long off, RecordFrame.Frame f, byte[] body) {
+        file.append(new MyEntry(...));
+    }
+    public void flush() {
+        file.flush();
+        cursor.save(progress());
+    }
+    // name/progress/close 略
+}
+```
+
+- `FixedUnitIndexFile` 复用 `SimpleMappedFileQueue` 的分段/滚动/flush/物理截断;
+- `SimpleMappedFileQueue.recoverWith(scanner)` 是通用恢复钩子,自定义格式只需定义"每个文件的有效前缀";
+- `IndexCursorFile` 提供原子游标与损坏退化;
+- 参考 `IndexFileToolkitTest` 里的 `RangeIndex`(固定 16B entry + 自定义 cursor,由 IndexHost 驱动)。
 
 以下章节展开磁盘格式与内部机制,用于理解门面背后的实现。本工程最初是一组演示:
 
@@ -467,23 +536,28 @@ flowchart TD
 
 1. 看协议表格（本 README 第一、三部分），脑中先有“磁盘上到底长什么样”；
 2. 看核心类：
-   - [SimpleMappedFileQueue]
+   - [SimpleMappedFileQueue] / [SimpleMappedFile]（分段、恢复钩子、物理截断）
    - [RecordStore]
    - [IndexHost] / [RecordIndex]（索引宿主与插件 SPI）
    - [ConsumeQueueIndex] / [KeyIndexPlugin]
+   - [FixedUnitIndexFile] / [IndexEntryCodec] / [IndexCursorFile]（自定义索引文件工具）
+   - [RecordScanner]（只读扫描与离线重写入口）
    - [MiniFileStore]（可选索引装配与能力视图）
-3. 跑一遍单测 [FileDemoTest]、[OptionalIndexTest]、[CustomIndexTest]，尤其是：
+3. 跑一遍单测 [FileDemoTest]、[OptionalIndexTest]、[CustomIndexTest]、[RecordScanTest]、[IndexFileToolkitTest]，尤其是：
    - 纯 WAL / 单索引 / 双索引装配；
    - 自定义索引的启动全量回放与写入增量驱动；
-   - 物理/逻辑 offset 读取；
-   - 时间范围查询；
-   - key 查询；
-   - 重启恢复场景。
+   - 自定义定长文件 + 游标 + IndexHost 的组合；
+   - 只读扫描跨文件、快照语义与按 offset 续扫；
+   - 物理/逻辑 offset 读取、时间范围查询、key 查询、重启恢复。
 4. 对照"待改进点"表格动手增强，当前状态一览：
    - ~~为记录增加 CRC 和魔数~~（已实现：帧格式 v2）；
    - ~~Reput 回放重建索引~~（已实现：`IndexHost` + 每索引独立游标，删索引目录可重建、后加索引可回放）；
    - ~~可选索引 / 自定义索引 SPI~~（已实现：`RecordIndex` + builder 装配）；
+   - ~~CommitLog 只读扫描~~（已实现：`RecordScanner` / `scanFrom` / `forEach`，支撑离线重写与启动加载）；
+   - ~~自定义索引文件工具~~（已实现：`FixedUnitIndexFile` + `recoverWith` + `IndexCursorFile`）；
    - ~~Checkpoint 双槽原子 + 被启动流程消费~~（已实现：v2 四水位；剩余——用 `logFlushMax` 缩小数据扫描起点）；
+   - 待做：在线 rewrite/generation 切换、删头/保留策略（当前只提供扫描 API 与离线切换路径）；
+   - 待做：消费位点等权威状态的 StateStore 抽象（不可从 CommitLog 重建）；
    - 待做：ConsumeQueue 恢复时的帧级 CRC 全量交叉校验（当前只做尾部截断）；
    - 待做：KeyIndexFile hash 槽结构（替代线性扫描）；
    - 待做：独立 FlushService 异步刷盘线程、过期文件删除与磁盘水位、munmap。
@@ -505,7 +579,7 @@ flowchart TD
 | 物理存储                  | CommitLog 多文件队列（MappedFileQueue）                   | `MmapSequentialLog` + `SimpleMappedFileQueue`                                      |
 | 单文件管理                | 固定大小，文件名为起始 offset，滚动创建                   | 同样：固定大小文件，文件名为起始 offset，滚动创建                                  |
 | 消息物理格式              | 头 + 体，包含多种字段（魔数、CRC、主题、队列 ID 等）      | v2 帧头：magic + storeTs + tagCode + keyHash + CRC + body                          |
-| 多 Topic/Queue 支持       | 所有消息写同一 CommitLog；按 Topic.Queue 维护 ConsumeQueue | 只做“单队列”模型，但 ConsumeQueue 结构与 RocketMQ 类似                            |
+| 多 Topic/Queue 支持       | 所有消息写同一 CommitLog；按 Topic.Queue 维护 ConsumeQueue | 内置单队列 CQ;自定义 `RecordIndex` + `FixedUnitIndexFile` 可实现带 topic/queueId 的索引 |
 | 逻辑队列索引结构          | ConsumeQueue：20 字节 `[offset][size][tagCode]`           | `SimpleConsumeQueue`：20 字节结构完全对齐                                          |
 | 按 Topic.Queue + offset 读 | 逻辑 offset → ConsumeQueue → CommitLog                    | `readByLogicalOffset` → `SimpleConsumeQueue` → `RecordStore.read`                  |
 | 按时间查询                | 结合 CommitLog 时间戳、文件名、tagCode/IndexFile          | 使用 `SimpleConsumeQueue` 的 tagCode 存时间戳，`queryByTimeRange` 顺序过滤         |
@@ -514,6 +588,7 @@ flowchart TD
 | 索引构建                  | put 只写 CommitLog，IndexHost 线程回放构建已启用索引 | ✅ 同模型：put 只写日志，`IndexHost` 按帧驱动 CQ/KeyIndex/自定义插件；SYNC/ASYNC 一致性分级 |
 | 宕机恢复                  | CommitLog 扫描 + ConsumeQueue 校验/截断 + IndexHost 重建索引 | 帧协议扫描(含全局前缀/脏尾) + CQ 交叉校验截断 + 按索引游标 catch-up，删索引目录/后加索引可重建 |
 | Checkpoint                | 独立 Checkpoint 文件记录多组件刷盘时间                    | v2 双槽原子(4水位+seq+CRC)；续传以各索引自身游标为准，checkpoint 保留诊断/兼容，logFlushMax 待用于缩小扫描范围 |
+| 日志重写 / 删头           | 支持 AOF/日志 compaction、按保留策略删除旧文件             | 已提供只读扫描;可用"新 store + 扫描旧日志 + 原子切目录"做离线重写;在线 generation/删头未实现 |
 | 磁盘空间回收              | 定时删除过期 CommitLog/ConsumeQueue/IndexFile             | 未实现，只关注写入/读取和索引逻辑                                                  |
 | HA 与多副本               | 主从同步 CommitLog，支持高可用                            | 未实现                                                                             |
 | 事务、重试、顺序消息等    | 上层协议和存储配合实现                                    | 未实现，聚焦底层存储原理                                                          |
@@ -557,6 +632,7 @@ flowchart TD
   - `RebuildInvariantTest`：**删除 CQ/KeyIndex 目录与 checkpoint 后重开，全部索引查询自动重建一致**（唯一真相源契约）；
   - `ReputServiceTest` / `ReputConsistencyTest`：回放顺序、awaitCovered 语义、close drain 不欠账、getByKey 去重；
   - `OptionalIndexTest` / `CustomIndexTest`：纯 WAL / 单索引 / 后加内置索引 / 自定义索引全量回放与增量驱动；
+  - `RecordScanTest` / `IndexFileToolkitTest`：只读扫描快照与续扫、定长索引文件 + 游标 + IndexHost 组合；
   - `ReputCheckpointTest` / `RecordFrameTest`：双槽原子、帧编解码三态判定。
 
 在模块根目录执行：

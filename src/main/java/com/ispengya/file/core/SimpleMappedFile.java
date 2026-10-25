@@ -243,6 +243,16 @@ public class SimpleMappedFile {
     }
 
     /**
+     * 整个文件的只读映射视图(position=0, limit=fileSize)
+     *
+     * <p>供自定义索引格式的恢复扫描使用;调用方不得修改返回的 buffer。
+     * 正常写入仍应走 {@link #append(byte[], int, int)},保持 wrotePosition 语义。</p>
+     */
+    public ByteBuffer mappedView() {
+        return this.mappedByteBuffer.asReadOnlyBuffer();
+    }
+
+    /**
      * 从指定文件内偏移位置读取一段数据，不改变写入位置
      *
      * @param position 文件内起始偏移
