@@ -50,9 +50,21 @@ public final class StoreMetadata {
      * @throws IllegalStateException 元数据损坏、版本不支持、配置与磁盘布局不一致
      */
     public static synchronized void verifyOrCreate(StoreConfig config) {
+        verifyOrCreate(config, true, true);
+    }
+
+    /**
+     * 校验现有元数据;只校验本次真正启用的索引尺寸
+     *
+     * @param validateConsumeQueue 是否启用 CQ(未启用时不校验其尺寸,也不应打开其目录)
+     * @param validateKeyIndex     是否启用 KeyIndex
+     */
+    public static synchronized void verifyOrCreate(StoreConfig config,
+                                                   boolean validateConsumeQueue,
+                                                   boolean validateKeyIndex) {
         File metaFile = new File(config.metaPath());
         if (metaFile.exists()) {
-            verify(config, metaFile, load(metaFile));
+            verify(config, metaFile, load(metaFile), validateConsumeQueue, validateKeyIndex);
             verifyExistingCommitLogFileSize(config);
         } else {
             // 旧库兼容:先确认现有数据文件长度与当前配置匹配,再补写元数据
@@ -77,16 +89,21 @@ public final class StoreMetadata {
     /**
      * 逐项比对配置与磁盘布局
      */
-    private static void verify(StoreConfig config, File metaFile, Properties properties) {
+    private static void verify(StoreConfig config, File metaFile, Properties properties,
+                               boolean validateConsumeQueue, boolean validateKeyIndex) {
         int version = intValue(metaFile, properties, KEY_VERSION);
         if (version != FORMAT_VERSION) {
             throw new IllegalStateException("unsupported store format version " + version
                     + " in " + metaFile.getPath() + " (expected " + FORMAT_VERSION + ")");
         }
         checkValue(metaFile, properties, KEY_COMMIT_LOG_FILE_SIZE, config.getCommitLogFileSize());
-        checkValue(metaFile, properties, KEY_CONSUME_QUEUE_FILE_SIZE, config.getConsumeQueueFileSize());
-        checkValue(metaFile, properties, KEY_KEY_INDEX_FILE_SIZE, config.getKeyIndexFileSize());
         checkValue(metaFile, properties, KEY_MAX_BODY_SIZE, config.getMaxBodySize());
+        if (validateConsumeQueue) {
+            checkValue(metaFile, properties, KEY_CONSUME_QUEUE_FILE_SIZE, config.getConsumeQueueFileSize());
+        }
+        if (validateKeyIndex) {
+            checkValue(metaFile, properties, KEY_KEY_INDEX_FILE_SIZE, config.getKeyIndexFileSize());
+        }
     }
 
     /**

@@ -13,7 +13,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 
 /**
- * 索引类观察/截断原语(Reput 的地基):count、cqCursor 自时钟、
+ * 索引类观察/截断原语(IndexHost 的地基):count、cqCursor 自时钟、
  * truncateBeyond 交叉校验截断、跨文件截断后的原位重写。
  */
 public class IndexCursorTest {

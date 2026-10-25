@@ -442,7 +442,7 @@ public class SimpleMappedFileQueue {
      * 返回物理偏移所在文件的下一个文件起点;没有下一个文件时原样返回。
      *
      * <p>帧不跨文件,封存文件尾部可能存在"装不下下一帧"的浪费区。
-     * Reput 游标落在该区域时用它跳到下一个文件起点,避免把零字节当数据/坏帧。</p>
+     * IndexHost 游标落在该区域时用它跳到下一个文件起点,避免把零字节当数据/坏帧。</p>
      */
     public synchronized long nextFileStartOffset(long offset) {
         for (int i = 0; i < mappedFiles.size(); i++) {

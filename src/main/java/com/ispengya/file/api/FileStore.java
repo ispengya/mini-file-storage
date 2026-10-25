@@ -25,6 +25,12 @@ import java.util.List;
  *
  * <p>线程模型:实现类的方法允许并发调用,单条记录的写入是串行的。</p>
  *
+ * <p>索引是可选的:{@link #getByLogicalIndex} 与 {@link #queryByTagRange} 需要
+ * ConsumeQueue 类索引,{@link #getByKey} 需要 KeyIndex。{@code MiniFileStore}
+ * 的兼容构造器默认启用两者;通过 builder 可以只启用部分或完全不启用。
+ * 未启用时调用对应方法会抛 {@code IllegalStateException};需要按能力判断时,
+ * 使用 {@code MiniFileStore.logical()} / {@code keys()} 或自定义索引的视图接口。</p>
+ *
  * @param <T> 业务记录类型
  */
 public interface FileStore<T> extends AutoCloseable {
@@ -60,12 +66,16 @@ public interface FileStore<T> extends AutoCloseable {
     /**
      * 按逻辑位点(第 N 条记录,从 0 开始)读取,经由 ConsumeQueue 定位。
      *
+     * <p>需要 ConsumeQueue 索引已启用;未启用时抛 {@code IllegalStateException}。</p>
+     *
      * @return 记录对象;位点不存在时返回 null
      */
     T getByLogicalIndex(long logicalIndex);
 
     /**
      * 按业务 key 查询候选记录。
+     *
+     * <p>需要 KeyIndex 已启用;未启用时抛 {@code IllegalStateException}。</p>
      *
      * <p>注意:当前 KeyIndex 仅存储 key 的 32 位 hash,hash 冲突时返回的
      * 是候选集合,调用方需要自行按业务字段二次校验。</p>
@@ -75,24 +85,25 @@ public interface FileStore<T> extends AutoCloseable {
     /**
      * 按 tagCode 范围查询 [beginTag, endTag] 内的记录。
      *
+     * <p>需要 ConsumeQueue 索引已启用;未启用时抛 {@code IllegalStateException}。</p>
+     *
      * <p>依赖 tagCode 单调(默认写当前时间戳)的前提,实现为顺序扫描。</p>
      */
     List<T> queryByTagRange(long beginTag, long endTag);
 
     /**
-     * 等待索引(ConsumeQueue 与 KeyIndex)完整覆盖"起始位置为 offset 的记录"。
+     * 等待所有启用索引完整覆盖"起始位置为 offset 的记录"。
      *
-     * <p>ASYNC 模式下索引读({@code getByLogicalIndex/getByKey/queryByTagRange})的最终一致
-     * 由本方法显式升级为强一致;SYNC 模式下恒立即返回 true。
-     * {@code get(offset)} 只读真相源,任何模式都无需等待。</p>
+     * <p>ASYNC 模式下索引读的最终一致由本方法显式升级为强一致;SYNC 模式下恒立即返回 true;
+     * 没有启用任何索引时也立即返回 true。{@code get(offset)} 只读真相源,任何模式都无需等待。</p>
      *
      * @param offset  put 返回的记录起始物理 offset
-     * @return true 已覆盖;false 超时或回放因帧损坏停止(见实现类的错误可见性)
+     * @return true 已覆盖;false 超时或回放因帧损坏/索引失败停止(见实现类的错误可见性)
      */
     boolean awaitIndexed(long offset, long timeoutMillis);
 
     /**
-     * 索引已覆盖到的 CommitLog 字节位点(单调不减)
+     * 所有启用索引覆盖位点的最小值(单调不减);没有索引时返回日志合法尾位点
      */
     long maxIndexedOffset();
 

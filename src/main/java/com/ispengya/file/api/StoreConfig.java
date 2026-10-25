@@ -14,7 +14,7 @@ public class StoreConfig {
      */
     public enum IndexMode {
         /**
-         * put 内部等待 Reput 把本条记录的索引建完才返回(默认):对外强一致,写放大最小化仍享受单路径
+         * put 内部等待所有启用索引把本条记录覆盖完才返回(默认):对外强一致;没有索引时立即返回
          */
         SYNC,
         /**

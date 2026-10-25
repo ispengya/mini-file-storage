@@ -40,7 +40,7 @@ public class SimpleMappedFile {
     /**
      * 是否已被判定为写满:帧装不下时置位。
      * 不再把 wrotePosition 抬到 fileSize——浪费区必须保持"不可读",
-     * 否则 Reput 会把零字节当成坏帧。
+     * 否则索引回放会把零字节当成坏帧。
      */
     private volatile boolean full;
     /**

@@ -22,7 +22,7 @@ import static org.junit.Assert.assertTrue;
  * 唯一真相源的契约测试:ConsumeQueue 与 KeyIndex 是"可弃的派生视图"。
  *
  * <p>物理删除两份索引目录 + checkpoint 后重开门面,全部索引查询必须与删除前
- * 逐条一致——由启动 catch-up 回放 CommitLog 自动完成。这就是 Reput 架构
+ * 逐条一致——由启动 catch-up 回放 CommitLog 自动完成。这就是索引插件架构
  * 区别于"同步双写"的根本承诺:索引丢了不是事故,是重建的触发条件。</p>
  */
 public class RebuildInvariantTest {

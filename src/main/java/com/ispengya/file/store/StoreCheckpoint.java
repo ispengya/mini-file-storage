@@ -9,7 +9,8 @@ import java.util.zip.CRC32;
 /**
  * 双槽原子检查点(v2)
  *
- * <p>记录三类水位,用于恢复加速、Reput 起点提示与索引交叉校验锚。
+ * <p>记录三类水位,用于恢复诊断与兼容。当前索引续传以各索引自身游标为准
+ * (CQ 自时钟 / KeyIndex cursor 文件);checkpoint 只保证"滞后但真实"。
  * 单槽直写存在"半写槽"风险(16B 覆写切在中间),v2 改为 A/B 两槽交替:
  * 每次 save 只重写"较旧"的那个槽并递增 seq,任何时刻至少一槽完整;
  * load 校验两槽(magic + CRC),取 seq 大的有效槽。</p>
@@ -20,8 +21,8 @@ import java.util.zip.CRC32;
  * 4  4   seq        单调递增序号,新槽写 max(seq)+1
  * 8  8   logFlushMax  CommitLog 已 flush 的最大物理 offset
  * 16 8   cqFlushMax     ConsumeQueue 文件已 flush 的最大字节 offset(-1 表示无 CQ)
- * 24 8   cqCursor       Reput 已构建索引到的日志位点(-1 表示不适用)
- * 32 8   keyCursor      Reput 已构建 KeyIndex 到的日志位点(-1 表示不适用)
+ * 24 8   cqCursor       CQ 插件已覆盖的日志位点(-1 表示未启用)
+ * 32 8   keyCursor      KeyIndex 插件已覆盖的日志位点(-1 表示未启用)
  * 40 4   crc          覆盖前 40 字节
  * </pre>
  *

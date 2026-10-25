@@ -93,7 +93,7 @@ public class SimpleConsumeQueue implements AutoCloseable {
 
     /**
      * ConsumeQueue 的"自时钟":CommitLog 中已被索引覆盖到的字节位点。
-     * 由最后一条合法索引的 physicalOffset + size 得出——Reput 重启续传的精确起点。
+     * 由最后一条合法索引的 physicalOffset + size 得出——CQ 插件重启续传的精确起点。
      *
      * @return 已索引位点;空队列为 0
      */
@@ -113,7 +113,7 @@ public class SimpleConsumeQueue implements AutoCloseable {
     /**
      * 交叉校验式尾部截断:丢弃所有"指向 maxLogOffset 之后数据"的索引条目。
      * 场景:断电后 CQ 的页落了盘、对应数据帧的页丢了——CQ 时钟超前于数据真相,
-     * 这些条目是撒谎指针,必须从尾部弹出,让 Reput 起点回退到与数据一致的位置。
+     * 这些条目是撒谎指针,必须从尾部弹出,让 CQ 插件的起点回退到与数据一致的位置。
      *
      * @param maxLogOffset CommitLog 恢复后的合法写位置(数据真相)
      * @return 被截断的条目数

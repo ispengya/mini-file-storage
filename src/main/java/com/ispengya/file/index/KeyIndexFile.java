@@ -84,7 +84,7 @@ public class KeyIndexFile {
     }
 
     /**
-     * 当前 key 索引条目数(供 Reput 观察进度;精确日志位点无法自推导,进度以 checkpoint 为准)
+     * 当前 key 索引条目数(供 KeyIndexPlugin/诊断观察;文件本身不含日志游标)
      */
     public synchronized long count() {
         return mappedFileQueue.getMaxOffset() / INDEX_UNIT_SIZE;

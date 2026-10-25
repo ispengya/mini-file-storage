@@ -43,7 +43,7 @@ public class RecordStore<T> implements AutoCloseable {
 
     /**
      * @deprecated 内联索引写路径仅为 FileDemoTest 等手装场景保留;新代码请用纯日志构造
-     *             (cq/checkpoint 传 null)并配 ReputService 构建索引
+     *             (cq/checkpoint 传 null)并配 IndexHost / MiniFileStore 构建索引
      */
     @Deprecated
     public RecordStore(SequentialLog log, Codec<T> codec, SimpleConsumeQueue consumeQueue, StoreCheckpoint checkpoint) {
@@ -163,7 +163,7 @@ public class RecordStore<T> implements AutoCloseable {
             cqOffset = consumeQueue.flush();
         }
         if (checkpoint != null) {
-            // 内联 legacy 模式没有 reput 概念:游标位写 -1 哨兵
+            // 内联 legacy 模式没有索引宿主概念:游标位写 -1 哨兵
             checkpoint.save(offset, cqOffset, -1L, -1L);
         }
         return offset;
