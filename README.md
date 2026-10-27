@@ -40,7 +40,19 @@ SYNC 模式下,`put` 等待所有启用索引覆盖本帧后返回;ASYNC 模式�
 
 ## 快速开始
 
-运行时要求 Java 8+;构建使用 JDK 17(产物为 Java 8 字节码)和 Maven。当前按源码/IDE 使用;执行 `mvn install` 后可按 `io.github.ispengya:file-storage:0.1.0` 从本地仓库引入。发布到 Maven Central 后可直接从中央仓库获取。
+运行时要求 Java 8+;构建使用 JDK 17(产物为 Java 8 字节码)和 Maven。
+
+Maven Central:[io.github.ispengya:file-storage:0.1.0](https://repo1.maven.org/maven2/io/github/ispengya/file-storage/0.1.0/)
+
+```xml
+<dependency>
+  <groupId>io.github.ispengya</groupId>
+  <artifactId>file-storage</artifactId>
+  <version>0.1.0</version>
+</dependency>
+```
+
+直接使用源码/IDE 时:
 
 ```bash
 mvn test

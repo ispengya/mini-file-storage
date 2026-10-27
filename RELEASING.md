@@ -38,14 +38,8 @@ gpg --keyserver hkps://keys.openpgp.org --send-keys <KEY_ID>
 gpg --keyserver keyserver.ubuntu.com --send-keys <KEY_ID>
 ```
 
-当前发布密钥指纹:
-
-```text
-E0D0D22DBB41E745173E30AC356D8913E73CC2F8
-```
-
-passphrase 保存在仓库外的 `~/.m2/central-gpg-passphrase`,release profile 通过
-`--passphrase-file` 读取它。不要把私钥、passphrase 或 Central token 提交到仓库。
+发布用的 GPG 密钥和 passphrase 由维护者在本机管理;release profile 通过
+`--passphrase-file` 读取仓库外的文件。不要把私钥、passphrase 或 Central token 提交到仓库。
 
 ## 4. 本地验证构建
 
@@ -90,7 +84,7 @@ mvn dependency:get -Dartifact=io.github.ispengya:file-storage:0.1.0
 - 提交并打 tag:
 
 ```bash
-git tag v0.1.0
+git tag vX.Y.Z
 git push origin master --tags
 ```
 
