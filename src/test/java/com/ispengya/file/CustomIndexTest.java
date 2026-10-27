@@ -50,7 +50,7 @@ public class CustomIndexTest {
             // SYNC 模式 put 返回时自定义索引已收到帧
             assertEquals("a", memory.get("a").getMessage());
             assertEquals("b", memory.get("b").getMessage());
-            assertSame(memory, store.index(KvView.class).orElseThrow());
+            assertSame(memory, store.index(KvView.class).orElseThrow(IllegalStateException::new));
             assertFalse(store.logical().isPresent());
             assertFalse(store.keys().isPresent());
         }
@@ -91,7 +91,7 @@ public class CustomIndexTest {
                 .build()) {
             // 新索引从 0 全量回放;已有 CQ 从自身 cursor 续传,不重复写入
             assertEquals(3, added.size());
-            assertEquals(3L, store.logical().orElseThrow().logicalCount());
+            assertEquals(3L, store.logical().orElseThrow(IllegalStateException::new).logicalCount());
             assertEquals("a", store.getByLogicalIndex(0).getMessage());
 
             store.put(record("d"), 13L);

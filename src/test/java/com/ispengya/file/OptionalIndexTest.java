@@ -115,7 +115,7 @@ public class OptionalIndexTest {
         try (MiniFileStore<LogRecord> store = MiniFileStore.builder(config, CODEC)
                 .withDefaultIndexes()
                 .build()) {
-            assertEquals(3L, store.logical().orElseThrow().logicalCount());
+            assertEquals(3L, store.logical().orElseThrow(IllegalStateException::new).logicalCount());
             assertEquals("c", store.getByLogicalIndex(2).getMessage());
             assertEquals("c", store.getByKey("key-c").get(0).getMessage());
         }
@@ -138,7 +138,7 @@ public class OptionalIndexTest {
         try (MiniFileStore<LogRecord> store = MiniFileStore.builder(config, CODEC)
                 .withDefaultIndexes()
                 .build()) {
-            assertEquals(2L, store.logical().orElseThrow().logicalCount());
+            assertEquals(2L, store.logical().orElseThrow(IllegalStateException::new).logicalCount());
             assertEquals("a", store.getByLogicalIndex(0).getMessage());
             assertEquals("b", store.getByKey("key-b").get(0).getMessage());
         }
@@ -155,7 +155,7 @@ public class OptionalIndexTest {
             for (int i = 0; i < 3; i++) {
                 store.put(record("cq-" + i), 100L + i);
             }
-            assertEquals(3L, store.logical().orElseThrow().logicalCount());
+            assertEquals(3L, store.logical().orElseThrow(IllegalStateException::new).logicalCount());
             assertEquals("cq-1", store.getByLogicalIndex(1).getMessage());
             assertEquals(2, store.queryByTagRange(101L, 102L).size());
             assertFalse(store.keys().isPresent());

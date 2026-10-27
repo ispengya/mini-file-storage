@@ -40,7 +40,7 @@ SYNC 模式下,`put` 等待所有启用索引覆盖本帧后返回;ASYNC 模式�
 
 ## 快速开始
 
-要求 JDK 8+ 和 Maven。当前按源码/IDE 使用;执行 `mvn install` 后可按 `com.ispengya:file-storage:1.0-SNAPSHOT` 从本地仓库引入。
+运行时要求 Java 8+;构建使用 JDK 17(产物为 Java 8 字节码)和 Maven。当前按源码/IDE 使用;执行 `mvn install` 后可按 `io.github.ispengya:file-storage:0.1.0` 从本地仓库引入。发布到 Maven Central 后可直接从中央仓库获取。
 
 ```bash
 mvn test
@@ -97,9 +97,9 @@ MiniFileStore<LogRecord> custom = MiniFileStore.builder(config, codec)
 查询能力按启用情况返回:
 
 ```java
-cqOnly.logical().orElseThrow().getByLogicalIndex(0);
-keyOnly.keys().orElseThrow().getByKey("order-1");
-custom.index(KvView.class).orElseThrow().get("order-1");
+cqOnly.logical().orElseThrow(IllegalStateException::new).getByLogicalIndex(0);
+keyOnly.keys().orElseThrow(IllegalStateException::new).getByKey("order-1");
+custom.index(KvView.class).orElseThrow(IllegalStateException::new).get("order-1");
 ```
 
 | 能力 | 依赖 |
@@ -251,6 +251,8 @@ KeyIndex:     [keyHash 8][physicalOffset 8]
 .
 ├── pom.xml
 ├── README.md
+├── LICENSE
+├── RELEASING.md
 ├── assets/readme/                    # README 图片
 └── src/
     ├── main/java/com/ispengya/file/
